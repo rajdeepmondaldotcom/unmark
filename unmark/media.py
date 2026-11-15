@@ -16,6 +16,9 @@ import numpy as np
 
 # shortcut: only 8-bit 4:2:0 is read and written, upgrade when a real source arrives in 10-bit or 4:2:2/4:4:4
 FORMATS = {"yuv420p", "yuvj420p"}
+# probe key -> ffmpeg option that stamps it on the raw frames going into the encoder
+COLOURS = {"color_range": "-color_range", "color_space": "-colorspace", "color_primaries": "-color_primaries",
+           "color_transfer": "-color_trc"}
 MUXERS = {".mp4": "mp4", ".mov": "mov", ".mkv": "matroska"}
 
 
@@ -49,7 +52,7 @@ def _run(args: list[str]) -> subprocess.CompletedProcess:
 
 
 def probe(src) -> dict:
-    """Probe a video: width, height, fps (rational string), pix_fmt, duration_s."""
+    """Probe a video: width, height, fps (rational string), pix_fmt, duration_s, and the colour tags it has."""
     src = Path(src)
     if not src.is_file():
         raise RuntimeError(f"{src} does not exist")
@@ -61,6 +64,14 @@ def probe(src) -> dict:
     fps = video.get("avg_frame_rate", "0/0")
     if fps in ("0/0", "0/1"):
         fps = video.get("r_frame_rate", "0/0")
+    # shortcut: 10-bit (so all HDR) is refused rather than squeezed to 8-bit, upgrade when a real one needs cleaning
+    if any(b in video.get("pix_fmt", "") for b in ("10le", "10be")):  # not a bare "10": yuv410p is 8-bit
+        raise RuntimeError(f"{src.name} is a 10-bit or HDR video, which unmark cannot clean yet; export an ordinary "
+                           "8-bit copy first")
+    # shortcut: ffmpeg turns decoded frames upright, so the size and box would not match; upgrade with -noautorotate
+    if any(d.get("rotation") for d in video.get("side_data_list", [])):
+        raise RuntimeError(f"{src.name} is a rotated (phone) video, which unmark cannot clean yet; export an upright "
+                           "copy first")
     if video.get("pix_fmt") not in FORMATS:
         raise RuntimeError(f"{src.name} stores its picture as {video.get('pix_fmt')}; only 8-bit 4:2:0 video "
                            "(yuv420p) is supported for now")
@@ -70,7 +81,9 @@ def probe(src) -> dict:
         "fps": fps,
         "pix_fmt": video["pix_fmt"],
         "duration_s": float(data.get("format", {}).get("duration") or video.get("duration") or 0),
-    }
+        # seconds from the file's first packet to the video's; ffmpeg counts each input's clock from its own start
+        "video_start_s": float(video.get("start_time") or 0) - float(data.get("format", {}).get("start_time") or 0),
+    } | {k: video[k] for k in COLOURS if video.get(k, "unknown") != "unknown"}
 
 
 def _views(buf: bytearray, w: int, h: int) -> Frame:
@@ -116,8 +129,10 @@ def planes(src, count: int, box: tuple[int, int, int, int] | None = None) -> Ite
     Each yielded Frame is valid only until the next one."""
     src = Path(src)
     info = probe(src)
-    rate = Fraction(count) / Fraction(info["duration_s"] or 1).limit_denominator(1000)
-    filters = [f"fps={rate}"] if rate < Fraction(info["fps"]) else []
+    # shortcut: assumes the video runs to the end of the file, upgrade if sources with long audio tails appear
+    span = info["duration_s"] - info["video_start_s"]
+    rate = Fraction(count) / Fraction(span if span > 0 else 1).limit_denominator(1000)
+    filters = ["setpts=PTS-STARTPTS", f"fps={rate}"] if rate < Fraction(info["fps"]) else []
     w, h = info["width"], info["height"]
     if box:
         x, y, w, h = box
@@ -134,34 +149,40 @@ def planes(src, count: int, box: tuple[int, int, int, int] | None = None) -> Ite
             raise _fail(p, log)
 
 
-def patch(src, dst, edit: Callable[[Frame], None]) -> int:
-    """Stream every frame of src through edit (in place) into dst, copying the audio untouched. Returns frames written."""
+def patch(src, dst, edit: Callable[[Frame], None], crf: int = 16) -> int:
+    """Stream every frame of src through edit (in place) into dst, copying the audio untouched. Returns frames written.
+    crf=0 is lossless."""
     src, dst = Path(src), Path(dst)
     info = probe(src)
     w, h, pf = info["width"], info["height"], info["pix_fmt"]
     part = dst.with_name(dst.name + ".part")
     enc_args = [_bin("ffmpeg"), "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
-                "-f", "rawvideo", "-pix_fmt", pf, "-s", f"{w}x{h}", "-r", info["fps"], "-i", "-",
-                "-i", str(src), "-map", "0:v", "-map", "1:a?", "-c:v", "libx264", "-crf", "16", "-pix_fmt", pf,
+                "-f", "rawvideo", "-pix_fmt", pf, "-s", f"{w}x{h}", "-framerate", info["fps"],
+                *(a for k, o in COLOURS.items() if k in info for a in (o, info[k])), "-i", "-",
+                "-i", str(src), "-map", "0:v", "-map", "1:a?",
+                # the pipe carries no timestamps; a fine time base keeps a start between two frame ticks exact
+                "-vf", f"settb=1/90000,setpts=PTS+{info['video_start_s']}/TB", "-enc_time_base:v", "filter",
+                "-c:v", "libx264", "-crf", str(crf), "-pix_fmt", pf,
                 "-c:a", "copy", "-f", MUXERS.get(dst.suffix.lower(), "matroska"), str(part)]
     n = 0
     try:
         with tempfile.TemporaryFile() as dlog, tempfile.TemporaryFile() as elog:
-            dec = _decode(src, pf, f"fps={info['fps']}", dlog)  # fps filter makes variable-rate input constant
+            # fps makes variable-rate input constant; starting at 0 stops it padding a late start with copies of frame 0
+            dec = _decode(src, pf, f"setpts=PTS-STARTPTS,fps={info['fps']}", dlog)
             enc = _popen(enc_args, elog, stdin=subprocess.PIPE)
             try:
                 for buf, frame in _frames(dec, w, h):
                     edit(frame)
                     enc.stdin.write(buf)
                     n += 1
-            except BrokenPipeError:
+            except OSError:  # BrokenPipeError, or EINVAL on Windows
                 pass  # the encoder died; its log says why
             finally:
                 dec.stdout.close()
                 dec.wait()
                 try:
                     enc.stdin.close()
-                except BrokenPipeError:
+                except OSError:
                     pass
                 enc.wait()
             if enc.returncode != 0:
