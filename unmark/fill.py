@@ -30,10 +30,9 @@ def _opencv(piece: list[np.ndarray], hole: np.ndarray) -> list[np.ndarray]:
     return [cv2.inpaint(c, hole.astype(np.uint8), RADIUS, cv2.INPAINT_TELEA) for c in piece]
 
 
-def _propainter(piece: list[np.ndarray], hole: np.ndarray, checkout: Path) -> list[np.ndarray]:
-    """Run the ProPainter checkout's script on piece; returns its filled frames."""
-    script = checkout / "inference_propainter.py"
-    if not script.is_file():
+def checkout_python(checkout: Path) -> str:
+    """The Python that runs the ProPainter checkout, raising a plain error if the folder or the Python is wrong."""
+    if not (checkout / "inference_propainter.py").is_file():
         raise RuntimeError(f"UNMARK_PROPAINTER is {checkout}, which is not a ProPainter checkout (it has no "
                            "inference_propainter.py)")
     python = os.environ.get("UNMARK_PROPAINTER_PYTHON") or str(
@@ -41,6 +40,12 @@ def _propainter(piece: list[np.ndarray], hole: np.ndarray, checkout: Path) -> li
     if not Path(python).is_file():
         raise RuntimeError(f"no Python found at {python}; create the checkout's .venv or set UNMARK_PROPAINTER_PYTHON "
                            "to the Python that has ProPainter's packages")
+    return python
+
+
+def _propainter(piece: list[np.ndarray], hole: np.ndarray, checkout: Path) -> list[np.ndarray]:
+    """Run the ProPainter checkout's script on piece; returns its filled frames."""
+    script, python = checkout / "inference_propainter.py", checkout_python(checkout)
     with tempfile.TemporaryDirectory(prefix="unmark-fill-") as tmp:
         tmp = Path(tmp)
         (tmp / "frames").mkdir()

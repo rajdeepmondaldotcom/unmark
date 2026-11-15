@@ -20,6 +20,7 @@ FORMATS = {"yuv420p", "yuvj420p"}
 COLOURS = {"color_range": "-color_range", "color_space": "-colorspace", "color_primaries": "-color_primaries",
            "color_transfer": "-color_trc"}
 MUXERS = {".mp4": "mp4", ".mov": "mov", ".mkv": "matroska"}
+FILTERS = ["null", "setpts", "fps", "crop", "scale", "scdet", "metadata", "settb"]  # every filter used below
 CUT_WIDTH = 160  # pixels; scene cuts are looked for on a picture this wide, which is plenty and cheap
 # shortcut: scdet score (0-100) above which a frame starts a new scene, set on synthetic clips (a soft cut scores 8.9,
 # smooth motion 0.1; ffmpeg's default 10 misses that cut), upgrade by calibrating on real game footage
