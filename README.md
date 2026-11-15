@@ -58,16 +58,18 @@ uv run unmark clean holiday.mp4 --box 478,22,132,60
 The cleaned video is called `holiday.clean.mp4`, next to the original. To choose another name, add
 `--out other-name.mp4`. The sound is copied over untouched.
 
-This is what it printed on a generated 20-second test clip with a see-through "UM" logo in the top right corner:
+This is what it printed on a generated 90-second 1080p test video (six scenes, a grey box in the lower left and a
+see-through "MyChannelName" in the lower right):
 
 ```
-$ uv run unmark clean holiday.mp4 --mark 1
-1: see-through at 482,32, size 80x46, opacity 49%
-wrote holiday.clean.mp4 (600 frames)
-overlay outline visibility (1.0 = gone): input 2.14, output 1.04
+$ uv run unmark clean holiday.mp4 --mark 2
+1: solid at 38,798, size 244x204, opacity 100%
+2: see-through at 1466,954, size 386x48, opacity 46%
+wrote holiday.clean.mp4 (2700 frames)
+overlay outline visibility (1.0 = gone): input 9.21, output 1.17
 ```
 
-The first line is the list of what it found: the kind of overlay (see-through or solid), where it is, its size, and
+The first lines are the list of what it found: the kind of overlay (see-through or solid), where it is, its size, and
 how strongly it covers the picture.
 
 If something goes wrong, it prints one line starting with `error:` that says what to do. Add `--debug` to see the
@@ -76,14 +78,18 @@ technical details, which help if you ask someone for help.
 ## Reading the result
 
 The last line, "overlay outline visibility", measures how sharp the overlay's outline is compared with the picture
-around it.
+around it, frame by frame, averaged over 100 frames. Differences of about a brightness level, which the eye cannot find,
+count as nothing, so the number means the same on a plain sky as on busy footage.
 
 - **About 1.0** means the outline can no longer be told apart from the picture: the overlay is gone.
+- **Below 1.0** means the outline is a little smoother than the picture around it.
 - **Above 1.25** means the outline can still be seen. Then it also prints
   `warning: the overlay's outline is still visible in the output; look at it before using it`.
 
-The number for the input tells you how visible the overlay was to begin with. Either way, watch the cleaned video
-before you use it. The number is a check, not a guarantee.
+As a guide: an outline 1 brightness level from the picture reads about 1.07 on a plain picture, one 5 levels away about
+1.75. The number for the input tells you how visible the overlay was to begin with; if that is 1.25 or less, there is
+nothing there to remove and it stops. Either way, watch the cleaned video before you use it. The number is a check, not
+a guarantee.
 
 ## How it works
 
@@ -91,8 +97,13 @@ before you use it. The number is a check, not a guarantee.
    anything that stays sharp in the same place is a fixed overlay.
 2. For a **see-through** overlay, the picture behind it still shows. Because the picture behind keeps changing, the
    tool can measure, pixel by pixel, how much the overlay dims the picture and what colour it adds.
-3. It then undoes that exactly in every frame: it subtracts the overlay's colour and brightens the picture back.
-   Pixels away from the overlay are left exactly as they were.
+   It measures this two ways: from how much the picture changes behind the overlay compared with around it, and,
+   frame by frame, from the picture just around the overlay, which predicts the picture behind it well when the
+   picture is smooth. It keeps whichever cleans a quarter of the frames, set aside for the purpose, best.
+3. It then undoes that in every frame: it subtracts the overlay's colour and brightens the picture back. Compression
+   leaves a faint ripple along the overlay's edges, which brightening makes stronger, so the cleaned pixels are smoothed
+   just enough that the outline is no sharper than the picture around it. Pixels away from the overlay are left exactly
+   as they were.
 4. A **solid** overlay hides the picture completely, so there is nothing to undo. The hidden area is filled in from the
    surrounding video instead: with ProPainter (an AI video filler) when it is set up on a computer with an NVIDIA
    graphics card, otherwise with a simpler fill from OpenCV that looks softer.
@@ -109,11 +120,15 @@ These are honest limits of this version.
   removed. With a see-through overlay, frames that do not have it (an intro, say) are left alone; a solid overlay's box
   is filled in every frame.
 - **The video must change enough.** Everything is measured from the picture changing behind the overlay. A very short
-  video, or a still scene (a slideshow, a static screen), gives too little change, and it will say it found nothing to
-  remove.
+  video, or one still scene (a slideshow, a static screen), gives too little change, and it will say it found nothing to
+  remove. A few different scenes are enough if the picture around the overlay is smooth.
+- **Overlays on screen for less than about 70% of the video** are not found automatically. Give the box with `--box`
+  instead.
 - **Very faint overlays** may not be found automatically. Give the box with `--box` instead.
-- **Heavily compressed video** can keep a faint ghost of the overlay, because compression blurs the very detail that is
-  measured.
+- **Compressed video** can keep a faint ghost of the overlay, because compression blurs the very detail that is
+  measured. On a 1080p download-quality test video the ghost is about one brightness level, which you may just find on
+  a large plain area of one colour if you look for it. The first frame after a scene cut can be compressed so roughly
+  that the overlay there is left as it is.
 - **Near-solid parts of a see-through overlay** (the overlay hides 85% or more of the picture there) are brightened back
   as far as they can be, not filled. Those spots can look noisy.
 - **Solid overlays with the simple fill look soft.** The fill takes the whole box, not just the overlay's own pixels.

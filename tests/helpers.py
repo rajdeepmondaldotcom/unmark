@@ -120,3 +120,18 @@ def smooth(n: int, w: int = 320, h: int = 180, seed: int = 0) -> np.ndarray:
             wave = np.sin((xx + i) / fx + p) + np.sin((yy + i / 2) / fy)  # no still rows or columns
             out[i, ..., c] = np.clip(level + 35 * wave, 0, 255).round()
     return out
+
+
+def still(n: int, w: int = 320, h: int = 180, scenes: int = 4, seed: int = 0) -> np.ndarray:
+    """n RGB frames (n, h, w, 3) uint8 in scenes with hard cuts, each one smooth colour gradient, nearly still: it
+    drifts by a few levels and a few pixels over the whole scene, like a sky, a wall or a title card."""
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    out = np.empty((n, h, w, 3), np.uint8)
+    for idx in np.array_split(np.arange(n), scenes):
+        level, slope, angle = rng.uniform(40, 200, 3), rng.uniform(-40, 40, 3), rng.uniform(0, np.pi)
+        for k, i in enumerate(idx):
+            t = k / max(1, len(idx) - 1)
+            ramp = ((xx + 4 * t) * np.cos(angle) + yy * np.sin(angle)) / max(w, h)
+            out[i] = np.clip(level + 4 * t + slope * ramp[..., None], 0, 255).round()
+    return out

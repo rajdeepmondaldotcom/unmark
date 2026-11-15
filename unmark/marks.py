@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import cv2
 import numpy as np
@@ -17,6 +17,12 @@ APART = 32.0  # luma levels: the flat colour's opacity is solved from the means 
 # shortcut: near-solid pixels of a see-through overlay are inverted with keep >= 0.15, upgrade by filling them instead
 FLOOR = 0.15
 PEAK = 10  # percentile of an overlay's keep taken as its peak; the very lowest few are noise or passing scenery
+HOLD = 4  # every this-many-th sampled frame is kept out of measuring, to choose the measurement that cleans it best
+# luma levels (the smoothing's range): compression leaves ringing at the overlay's edges and inverting makes it larger;
+# the least smoothing that leaves the outline no sharper than the picture around it is kept, on frames held out
+SMOOTH = (0.0, 2.0, 4.0, 8.0, 16.0)
+REACH = 7  # pixels across the window that smoothing averages over
+FAINT = 1.0  # luma levels per pixel: an outline gradient this weak cannot be seen, so visibility counts it as none
 
 MEAN_EDGE = 3.0  # luma levels per half-size pixel: a stretch's averaged picture is smoother, a fixed overlay's edge not
 VAR_EDGE = 0.25  # natural-log units per pixel, the same test on the log of the temporal variance
@@ -38,11 +44,12 @@ AGREE = 0.7  # share of those stretches an overlay's outline must be sharp in, w
 class Mark:
     """A fixed overlay: its box (x, y, w, h, even-aligned luma pixels), kind, peak opacity, and per plane where it
     sits in the full frame, which pixels it covers, and keep / offset (a solid mark: luma only, its unchanging
-    pixels, empty keep / offset)."""
+    pixels, empty keep / offset), and how much the cleaned pixels are smoothed (one of SMOOTH)."""
     box: tuple[int, int, int, int]
     kind: str
     opacity: float
     parts: list[tuple[tuple[slice, slice], np.ndarray, np.ndarray, np.ndarray]] = field(default_factory=list, repr=False)
+    smooth: float = 0.0
 
     def erase(self, frame: Frame) -> None:
         """Clean one full-size frame in place, unless that would leave the overlay's outline sharper than it was (so
@@ -56,35 +63,76 @@ class Mark:
         for plane, (where, sel, keep, offset) in zip((frame.u, frame.v), self.parts[1:]):
             p = plane[where]
             p[sel] = np.clip(np.rint((p[sel] - offset) / keep), 0, 255)
+            if self.smooth:
+                p[sel] = cv2.bilateralFilter(p, REACH, self.smooth, REACH / 2.5)[sel]
 
     def _luma(self, frame: Frame) -> np.ndarray | None:
         """The cleaned luma around the overlay, or None when inverting would leave its outline sharper than it is."""
-        where, sel, keep, offset = self.parts[0]
-        seen = frame.y[where].astype(np.float32)
+        return self._clean(frame.y[self.parts[0][0]].astype(np.float32))
+
+    def _clean(self, seen: np.ndarray) -> np.ndarray | None:
+        """_luma on the luma around the overlay, as float32."""
+        _, sel, keep, offset = self.parts[0]
         real = seen.copy()
         real[sel] = np.clip(np.rint((seen[sel] - offset) / keep), 0, 255)
-        outline = _outline(sel)[0]
-        return real if _edges(real)[outline].mean() < _edges(seen)[outline].mean() else None
+        outline = _outline(self._core())[0]
+        if _edges(real)[outline].mean() >= _edges(seen)[outline].mean():
+            return None
+        if self.smooth:
+            real[sel] = cv2.bilateralFilter(real.astype(np.uint8), REACH, self.smooth, REACH / 2.5)[sel]
+        return real
+
+    def _core(self) -> np.ndarray:
+        """The pixels the overlay dims noticeably; a mark may also correct the faint skirt around them."""
+        _, sel, keep, _ = self.parts[0]
+        core = sel.copy()
+        if self.kind != "solid":
+            core[sel] = keep < OVERLAY
+        return core
 
     def refined(self, frames: Iterable[Frame]) -> Mark:
         """This see-through mark measured again on only the frames it is in, so frames without it (an intro, say) do
-        not water the measurement down; a solid mark is returned as it is."""
+        not water the measurement down, both ways, keeping the one that leaves its outline least visible on frames
+        held out of _fitted (_measure sees them too, which favours it where the two are close), with the least
+        smoothing that leaves it no sharper than nearby picture there; a solid mark is returned as it is."""
         if self.kind == "solid":
             return self
         if not self.parts[0][1].any():
             raise RuntimeError(NOTHING)
-        return _measure(*_stats((f for f in frames if self._luma(f) is not None), NOTHING), self.box)
+        luma, chroma = self.parts[0][0], self.parts[1][0]
+        # shortcut: the padded crops of every sampled frame are kept in memory (about 50 MB for a 420x70 box), upgrade
+        # by keeping only a sample of them if very large boxes are given
+        fit, held = [], []
+
+        def split(frames: Iterable[Frame]) -> Iterator[Frame]:
+            for i, f in enumerate(f for f in frames if self._luma(f) is not None):
+                if i % HOLD:
+                    fit.append(Frame(f.y[luma].copy(), f.u[chroma].copy(), f.v[chroma].copy()))
+                else:
+                    held.append(f.y[luma].astype(np.float32))
+                yield f
+
+        measured = _measure(*_stats(split(frames), NOTHING), self.box)
+        if not held or not measured.parts[0][1].any():
+            return measured
+
+        def score(m: Mark) -> float:  # on the same outline for both
+            return measured._visibility(r if (r := m._clean(c)) is not None else c for c in held)
+
+        best = min(measured, _fitted(measured, fit), key=score)  # unsmoothed, as smoothing evens them out
+        smoothed = [replace(best, smooth=s) for s in SMOOTH]
+        return next((m for m in smoothed if score(m) <= 1), smoothed[-1])
 
     def visibility(self, frames: Iterable[Frame]) -> float:
-        """Average luma gradient on the overlay's outline over that on nearby picture; 1.0 means the outline is gone."""
-        where, sel = self.parts[0][:2]
-        outline, near = _outline(sel)
-        on = off = 0.0
-        for f in frames:
-            g = _edges(f.y[where].astype(np.float32))
-            on += g[outline].mean()
-            off += g[near].mean()
-        return on / max(off, 1e-6)
+        """How much sharper the overlay's outline is than nearby picture, averaged over frames; 1.0 means it is gone."""
+        return self._visibility(f.y[self.parts[0][0]].astype(np.float32) for f in frames)
+
+    def _visibility(self, lumas: Iterable[np.ndarray]) -> float:
+        """visibility on the luma around the overlay. Gradients count from FAINT, so the faint noise of a smooth
+        picture does not read as a visible outline."""
+        outline, near = _outline(self._core())
+        ratios = [(g[outline].mean() + FAINT) / (g[near].mean() + FAINT) for g in map(_edges, lumas)]
+        return float(np.mean(ratios)) if ratios else 1.0
 
 
 def _outline(sel: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -96,6 +144,46 @@ def _outline(sel: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 def _fill(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Interpolate img inward over mask from the surrounding pixels."""
     return cv2.inpaint(img.astype(np.float32), mask.astype(np.uint8), 5, cv2.INPAINT_TELEA)
+
+
+def _line(seen: np.ndarray, behind: np.ndarray, keep: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Per column, keep and offset of the line seen = offset + keep * behind across rows, fitted again twice without
+    the points far off it (frames where the picture behind was not interpolated well); with keep, only offset."""
+    use = np.ones(seen.shape, bool)
+    for _ in range(3):
+        n = use.sum(0)
+        mb, ms = (use * behind).sum(0) / n, (use * seen).sum(0) / n
+        k = keep if keep is not None else (
+            (use * (behind - mb) * (seen - ms)).sum(0) / np.maximum((use * (behind - mb) ** 2).sum(0), 1e-6))
+        k = np.clip(k, FLOOR, 1)
+        off = ms - k * mb
+        miss = np.abs(seen - off - k * behind)
+        use = miss <= 2 * np.median(miss, axis=0) + 1
+    return k, off
+
+
+def _fitted(mark: Mark, crops: list[Frame]) -> Mark:
+    """mark measured again from the padded crops of frames: per pixel, a line fit of what is seen against the picture
+    behind as interpolated from that frame's own surroundings. Unlike _measure it needs only a few different
+    pictures behind the overlay, but they must be smooth enough to interpolate across it. It also covers the faint
+    skirt just outside mark's pixels."""
+    luma, overlay = mark.parts[0][:2]
+    k = np.ones((5, 5), np.uint8)
+    sel = cv2.dilate(overlay.astype(np.uint8), k)
+    unknown = cv2.dilate(sel, k).astype(bool)
+    sel = sel.astype(bool)
+    keep, offset = _line(*(np.stack(v) for v in zip(*((s[sel], _fill(s, unknown)[sel])
+                                                       for s in (c.y.astype(np.float32) for c in crops)))))
+    full = np.ones(sel.shape, np.float32)
+    full[sel] = keep
+    ah, aw = sel.shape
+    keep_c = full.reshape(ah // 2, 2, aw // 2, 2).mean(axis=(1, 3))
+    sel_c, unknown_c = (m.reshape(ah // 2, 2, aw // 2, 2).any(axis=(1, 3)) for m in (sel, unknown))
+    parts = [(luma, sel, keep, offset)]
+    for (chroma, *_), planes in zip(mark.parts[1:], ([c.u for c in crops], [c.v for c in crops])):
+        seen, behind = zip(*((p[sel_c], _fill(p, unknown_c)[sel_c]) for p in (q.astype(np.float32) for q in planes)))
+        parts.append((chroma, sel_c, keep_c[sel_c], _line(np.stack(seen), np.stack(behind), keep_c[sel_c])[1]))
+    return Mark(mark.box, mark.kind, mark.opacity, parts)
 
 
 def _stats(frames: Iterable[Frame], few: str = "the video has too few frames to measure the overlay"

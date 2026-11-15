@@ -2,7 +2,7 @@ import subprocess
 
 import cv2
 import numpy as np
-from helpers import clean_frames, encode, footage, stamp, text_opacity
+from helpers import clean_frames, encode, footage, stamp, still, text_opacity
 
 from unmark import marks, media
 
@@ -146,6 +146,22 @@ def test_visibility_tells_a_stamped_outline_from_the_picture_and_a_cleaned_one(t
     print(f"visibility: marked {seen:.2f}, clean {truth:.2f}, cleaned {out:.2f}")
     assert seen > 1.5
     assert abs(truth - 1) < 0.15 and abs(out - 1) < 0.15
+
+
+def test_visibility_means_the_same_on_a_smooth_picture(tmp_path):
+    box = (208, 16, 96, 48)
+    real, opacity = still(160, W, H), text_opacity(W, H, box)
+    mark = marks.find(lambda: media.planes(encode(stamp(real, opacity, 215), tmp_path / "m.mp4", audio=False, crf=23),
+                                           1000), box)[0]
+
+    def outline(share: float) -> float:
+        """Visibility of the overlay stamped at share of its opacity: its outline steps up to 52 * share levels."""
+        clip = encode(stamp(real, opacity * share, 215), tmp_path / f"{share}.mp4", audio=False, crf=23)
+        return mark.visibility(media.planes(clip, 1000))
+
+    unseen, seen = outline(0.02), outline(0.1)  # steps of at most 1 level, which the eye cannot find, and of 5
+    print(f"visibility: 1-level outline {unseen:.2f}, 5-level outline {seen:.2f}")
+    assert abs(unseen - 1) < 0.15 and seen > 1.5
 
 
 def test_finding_reads_the_frames_once_and_a_given_box_twice(tmp_path):

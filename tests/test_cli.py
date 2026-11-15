@@ -17,6 +17,7 @@ from helpers import (
     psnr,
     smooth,
     stamp,
+    still,
     text_opacity,
 )
 
@@ -89,6 +90,26 @@ def test_clean_beats_delogo_on_compressed_footage(tmp_path, capsys):
     said = capsys.readouterr().out
     shown = re.search(r"outline visibility \(1\.0 = gone\): input ([\d.]+), output ([\d.]+)", said)
     assert shown and float(shown[1]) > 1.5 and float(shown[2]) < 1.15 and "still visible" not in said
+
+
+def test_clean_leaves_no_outline_on_smooth_still_scenes(tmp_path, capsys):
+    real = still(160, W, H, scenes=4)
+    truth = decode_luma(encode(real, tmp_path / "clean.mp4", audio=False), W, H)
+    marked = encode(stamp(real, text_opacity(W, H, BOX), 215), tmp_path / "marked.mp4", audio=False, crf=23)
+    out = tmp_path / "out.mp4"
+
+    assert cli.main(["clean", str(marked), "--box", ",".join(map(str, BOX)), "--out", str(out)]) == 0
+
+    x, y, w, h = BOX
+    o, t = (v[:, y:y + h, x:x + w] for v in (decode_luma(out, W, H), truth))
+    worst = min(psnr(a, b) for a, b in zip(o, t))
+    print(f"inside box vs lossless clean: average {psnr(o, t):.2f} dB, worst frame {worst:.2f} dB")
+    # outline-free results measure 49.2 to 49.8 dB, worst frame 43.9 to 45.7, over seeds 0 to 2; the faint outline
+    # this test was written against measured 45.3 and 41.8
+    assert psnr(o, t) >= 48 and worst >= 43
+    said = capsys.readouterr().out
+    shown = re.search(r"outline visibility \(1\.0 = gone\): input ([\d.]+), output ([\d.]+)", said)
+    assert shown and float(shown[2]) <= cli.VISIBLE and "still visible" not in said
 
 
 def test_clean_warns_when_the_outline_is_still_visible(tmp_path, capsys, monkeypatch):
