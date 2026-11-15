@@ -15,6 +15,8 @@ import numpy as np
 from unmark import marks, media
 
 SAMPLES = 1000  # frames measured; more average out the picture, fewer read faster
+CHECKS = 100  # frames sampled from the input and the written output to check how visible the outline is
+VISIBLE = 1.25  # outline visibility above this counts as still visible; clean pictures measure about 1.0
 COLOURS = [(0, 0, 255), (0, 200, 0), (255, 0, 0), (0, 200, 255), (255, 0, 255), (255, 255, 0)]  # BGR
 
 
@@ -71,10 +73,10 @@ def clean(video: str, box_text: str | None, mark: int | None, out: str | None) -
     if dst.resolve() == src.resolve():
         raise RuntimeError("--out must differ from the input video")
     if box_text is not None:
-        chosen = marks.find(media.planes(src, SAMPLES), _box(box_text, info["width"], info["height"]))[0]
+        chosen = marks.find(lambda: media.planes(src, SAMPLES), _box(box_text, info["width"], info["height"]))[0]
     else:
         kept: list[np.ndarray] = []
-        found = marks.find(_keep_one(media.planes(src, SAMPLES), kept))
+        found = marks.find(lambda: _keep_one(media.planes(src, SAMPLES), kept))
         if not found:
             raise RuntimeError("no fixed overlay was found; if you can see one, give its position with --box x,y,w,h")
         picture = src.with_name(f"{src.stem}.marks.png")
@@ -100,6 +102,11 @@ def clean(video: str, box_text: str | None, mark: int | None, out: str | None) -
 
     n = media.patch(src, dst, edit)
     print(f"wrote {dst} ({n} frames)")
+    # shortcut: each check decodes the whole file again, upgrade with keyframe seeks if long videos feel slow
+    before, after = (chosen.visibility(media.planes(p, CHECKS)) for p in (src, dst))
+    print(f"overlay outline visibility (1.0 = gone): input {before:.2f}, output {after:.2f}")
+    if after > VISIBLE:
+        print("warning: the overlay's outline is still visible in the output; look at it before using it")
     return 0
 
 

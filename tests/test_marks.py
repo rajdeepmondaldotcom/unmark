@@ -1,5 +1,5 @@
 import numpy as np
-from helpers import clean_frames, encode, stamp, text_opacity
+from helpers import clean_frames, encode, footage, stamp, text_opacity
 
 from unmark import marks, media
 
@@ -41,7 +41,7 @@ def test_find_tells_see_through_text_from_solid_panel_and_ignores_letterbox(tmp_
     opacity = text_opacity(W, H, TEXT, peak=0.45)
     clip = encode(letterbox(hud(stamp(clean_frames(150, W, H, seed=2), opacity))), tmp_path / "a.mp4", audio=False)
 
-    found = marks.find(media.planes(clip, 1000))
+    found = marks.find(lambda: media.planes(clip, 1000))
 
     assert [m.kind for m in found] == ["see-through", "solid"]  # the text sits higher than the panel
     see = [m for m in found if m.kind == "see-through"]
@@ -60,4 +60,23 @@ def test_find_skips_structure_inside_a_still_part_of_the_scene(tmp_path):
     frames[:, 80:100, 150:190] = 40  # a dark sign painted on it
     clip = encode(frames, tmp_path / "still.mp4", audio=False)
 
-    assert marks.find(media.planes(clip, 1000)) == []
+    assert marks.find(lambda: media.planes(clip, 1000)) == []
+
+
+def test_visibility_tells_a_stamped_outline_from_the_picture_and_a_cleaned_one(tmp_path):
+    box = (208, 16, 96, 48)
+    real = footage(300, W, H, seed=5)
+    clean = encode(real, tmp_path / "clean.mp4", audio=False, crf=28)
+    marked = encode(stamp(real, text_opacity(W, H, box)), tmp_path / "marked.mp4", audio=False, crf=28)
+    mark = marks.find(lambda: media.planes(marked, 1000), box)[0]
+
+    def cleaned():
+        for f in media.planes(marked, 1000):
+            mark.erase(f)
+            yield f
+
+    seen, truth, out = (mark.visibility(frames) for frames in (media.planes(marked, 1000), media.planes(clean, 1000),
+                                                                cleaned()))
+    print(f"visibility: marked {seen:.2f}, clean {truth:.2f}, cleaned {out:.2f}")
+    assert seen > 1.5
+    assert abs(truth - 1) < 0.15 and abs(out - 1) < 0.15

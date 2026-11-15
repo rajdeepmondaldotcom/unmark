@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 import cv2
@@ -12,6 +12,7 @@ from unmark.media import Frame
 
 PAD = 16  # luma pixels of plain background kept around the box to interpolate from
 OVERLAY = 0.97  # keep below this counts as overlay; plain background measures within a percent or two of 1
+FLAT = 24.0  # luma levels: an overlay whose colour's interquartile spread is below this is one flat colour
 FLOOR = 0.15  # shortcut: near-solid pixels are inverted with keep >= 0.15, upgrade when solid overlays get their own fill
 
 MEAN_EDGE = 3.0  # luma levels per pixel: the averaged picture is smoother than this, a fixed overlay's edge is not
@@ -37,13 +38,44 @@ class Mark:
     parts: list[tuple[tuple[slice, slice], np.ndarray, np.ndarray, np.ndarray]] = field(default_factory=list, repr=False)
 
     def erase(self, frame: Frame) -> None:
-        """Clean one full-size frame in place; pixels outside the overlay are left exactly as they were."""
+        """Clean one full-size frame in place, unless that would leave the overlay's outline sharper than it was (so
+        the overlay is not in this frame); pixels outside the overlay are left exactly as they were."""
         if self.kind == "solid":
             raise RuntimeError("this mark is solid (it hides the picture completely), and removing solid marks is not "
                                "supported yet")
-        for plane, (where, sel, keep, offset) in zip((frame.y, frame.u, frame.v), self.parts):
+        real = self._luma(frame)
+        if real is None:
+            return
+        frame.y[self.parts[0][0]] = real
+        for plane, (where, sel, keep, offset) in zip((frame.u, frame.v), self.parts[1:]):
             p = plane[where]
             p[sel] = np.clip(np.rint((p[sel] - offset) / keep), 0, 255)
+
+    def _luma(self, frame: Frame) -> np.ndarray | None:
+        """The cleaned luma around the overlay, or None when inverting would leave its outline sharper than it is."""
+        where, sel, keep, offset = self.parts[0]
+        seen = frame.y[where].astype(np.float32)
+        real = seen.copy()
+        real[sel] = np.clip(np.rint((seen[sel] - offset) / keep), 0, 255)
+        outline = _outline(sel)[0]
+        return real if _edges(real)[outline].mean() < _edges(seen)[outline].mean() else None
+
+    def visibility(self, frames: Iterable[Frame]) -> float:
+        """Average luma gradient on the overlay's outline over that on nearby picture; 1.0 means the outline is gone."""
+        where, sel = self.parts[0][:2]
+        outline, near = _outline(sel)
+        on = off = 0.0
+        for f in frames:
+            g = _edges(f.y[where].astype(np.float32))
+            on += g[outline].mean()
+            off += g[near].mean()
+        return on / max(off, 1e-6)
+
+
+def _outline(sel: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The pixels of mask sel within 2 of its edge, and the pixels more than 2 away from it outside."""
+    m, k = sel.astype(np.uint8), np.ones((5, 5), np.uint8)
+    return sel & ~cv2.erode(m, k).astype(bool), ~cv2.dilate(m, k).astype(bool)
 
 
 def _fill(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -88,8 +120,17 @@ def _measure(mean: list[np.ndarray], var: list[np.ndarray], box: tuple[int, int,
         keep = np.where(unknown, np.sqrt(v0 / np.maximum(_fill(v0, unknown), 1e-6)), 1.0).clip(0, 1)
         overlay = inside & (keep < OVERLAY)
     opacity = float(1 - keep[overlay].min()) if overlay.any() else 0.0
+    behind = _fill(m0, unknown)
+    core = overlay & (1 - keep > opacity / 2)
+    if core.any():
+        colour = (m0[core] - keep[core] * behind[core]) / (1 - keep[core])
+        q1, c, q3 = np.percentile(colour, [25, 50, 75])
+        if q3 - q1 < FLAT:  # one flat colour: re-solve opacity from the means, far less noisy than the variance ratio
+            keep = np.where(unknown, 1 - ((m0 - behind) / (c - behind)).clip(0, 1), 1.0)
+            overlay = inside & (keep < OVERLAY)
+            opacity = float(1 - keep[overlay].min()) if overlay.any() else 0.0
     keep = np.maximum(keep, FLOOR)
-    offset = m0 - keep * _fill(m0, unknown)
+    offset = m0 - keep * behind
 
     # chroma variance is small and noisy, so chroma reuses the luma keep and solves only its offset
     blocks = (ah // 2, 2, aw // 2, 2)
@@ -126,9 +167,18 @@ def _regions(mean: np.ndarray, var: np.ndarray) -> list[tuple[int, int, int, int
     return boxes
 
 
-def find(frames: Iterable[Frame], box: tuple[int, int, int, int] | None = None) -> list[Mark]:
-    """Every fixed overlay in full-size frames, each measured; with box (even-aligned luma pixels), just that one."""
-    mean, var = _stats(frames)
+def find(frames: Callable[[], Iterable[Frame]], box: tuple[int, int, int, int] | None = None) -> list[Mark]:
+    """Every fixed overlay in full-size frames, each measured; with box (even-aligned luma pixels), just that one.
+    frames() gives a fresh run of the same frames each call: each see-through overlay is measured a second time on
+    only the frames it is in, so frames without it (an intro, say) do not water the measurement down."""
+    mean, var = _stats(frames())
+    # shortcut: the second measurement reads the frames again per overlay, upgrade to one shared pass if that is slow
+    return [_measure(*_stats(f for f in frames() if m._luma(f) is not None), m.box)
+            if m.kind == "see-through" and m.parts[0][1].any() else m for m in _first(mean, var, box)]
+
+
+def _first(mean: list[np.ndarray], var: list[np.ndarray], box: tuple[int, int, int, int] | None) -> list[Mark]:
+    """The overlays as measured on all frames."""
     if box:
         return [_measure(mean, var, box)]
     found = []

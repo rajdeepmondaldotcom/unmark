@@ -21,6 +21,39 @@ def clean_frames(n: int = 150, w: int = 320, h: int = 180, seed: int = 0) -> np.
     return out
 
 
+def footage(n: int = 300, w: int = 320, h: int = 180, scenes: int = 5, seed: int = 0) -> np.ndarray:
+    """Temporally coherent RGB footage (n, h, w, 3) uint8: scenes with hard cuts, each panning or zooming over a
+    detailed texture while its brightness drifts, and a different brightness in each scene."""
+    rng = np.random.default_rng(seed)
+    out = np.empty((n, h, w, 3), np.uint8)
+    for s, idx in enumerate(np.array_split(np.arange(n), scenes)):
+        tw, th = 2 * w, 2 * h
+        texture = np.zeros((th, tw, 3), np.float32)
+        for cell, amp, planes in ((64, 25, 3), (16, 20, 1), (3, 10, 1)):  # colour patches, then grey detail and grain
+            coarse = rng.normal(0, 1, (th // cell + 1, tw // cell + 1, planes)).astype(np.float32)
+            texture += cv2.resize(coarse, (tw, th), interpolation=cv2.INTER_CUBIC).reshape(th, tw, -1) * amp
+        for _ in range(60):  # hard-edged objects
+            x0, y0 = int(rng.integers(0, tw)), int(rng.integers(0, th))
+            size, shade = int(rng.integers(4, 40)), tuple(float(c) for c in rng.normal(0, 40, 3))
+            if rng.random() < 0.5:
+                cv2.rectangle(texture, (x0, y0), (x0 + size, y0 + int(rng.integers(2, 30))), shade, -1)
+            else:
+                cv2.circle(texture, (x0, y0), size // 2, shade, -1, cv2.LINE_AA)
+        start, end = rng.uniform(50, 180, 2)  # brightness at the start and end of the scene
+        zoom = s % 2 == 1
+        vx, vy = rng.uniform(-3, 3, 2)
+        for k, i in enumerate(idx):
+            t = k / max(1, len(idx) - 1)
+            if zoom:
+                m = cv2.getRotationMatrix2D((tw / 2, th / 2), 0, 1 + 0.5 * t)
+                m[:, 2] -= (tw - w) / 2, (th - h) / 2
+            else:
+                m = np.float32([[1, 0, -w / 2 - vx * k], [0, 1, -h / 2 - vy * k]])
+            view = cv2.warpAffine(texture, m, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+            out[i] = np.clip(view + start + (end - start) * t, 0, 255).round().astype(np.uint8)
+    return out
+
+
 def text_opacity(w: int, h: int, box: tuple[int, int, int, int], text: str = "UM", peak: float = 0.45) -> np.ndarray:
     """A (h, w) float opacity map: thick soft-edged letters filling box (x, y, bw, bh), zero elsewhere."""
     x, y, bw, bh = box
@@ -38,14 +71,15 @@ def stamp(frames: np.ndarray, opacity: np.ndarray, colour: float = 200.0) -> np.
     return np.clip(a * colour + (1 - a) * frames, 0, 255).round().astype(np.uint8)
 
 
-def encode(frames: np.ndarray, path: Path, fps: int = 30, audio: bool = True) -> Path:
-    """Encode RGB frames losslessly to yuv420p H.264, optionally with a sine audio track."""
+def encode(frames: np.ndarray, path: Path, fps: int = 30, audio: bool = True, crf: int | None = None) -> Path:
+    """Encode RGB frames to yuv420p H.264, losslessly unless crf is given, optionally with a sine audio track."""
     n, h, w, _ = frames.shape
     args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
             "-s", f"{w}x{h}", "-r", str(fps), "-i", "-"]
     if audio:
         args += ["-f", "lavfi", "-i", f"sine=frequency=440:duration={n / fps}", "-c:a", "aac"]
-    args += ["-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p", str(path)]
+    quality = ["-qp", "0"] if crf is None else ["-crf", str(crf), "-preset", "medium"]
+    args += ["-c:v", "libx264", *quality, "-pix_fmt", "yuv420p", str(path)]
     subprocess.run(args, input=frames.tobytes(), check=True)
     return Path(path)
 

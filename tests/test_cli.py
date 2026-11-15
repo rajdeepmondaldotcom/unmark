@@ -1,15 +1,19 @@
+import re
+import subprocess
+
 import numpy as np
 from helpers import (
     clean_frames,
     decode_luma,
     encode,
+    footage,
     has_audio,
     psnr,
     stamp,
     text_opacity,
 )
 
-from unmark import cli
+from unmark import cli, marks
 
 W, H = 320, 180
 BOX = (208, 16, 96, 48)  # near the top-right corner, like a typical logo
@@ -42,6 +46,38 @@ def test_clean_removes_see_through_overlay(tmp_path):
     out = tmp_path / "out.mp4"
     assert cli.main(["clean", str(marked), "--box", ",".join(map(str, BOX)), "--out", str(out)]) == 0
     check_cleaned(clean, marked, out)
+
+
+def test_clean_beats_delogo_on_compressed_footage(tmp_path, capsys):
+    real = footage(300, W, H, seed=5)
+    truth = decode_luma(encode(real, tmp_path / "clean.mp4", audio=False), W, H)
+    marked = encode(stamp(real, text_opacity(W, H, BOX)), tmp_path / "marked.mp4", crf=28)
+    out, delogo = tmp_path / "out.mp4", tmp_path / "delogo.mp4"
+    x, y, w, h = BOX
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(marked), "-vf",
+                    f"delogo=x={x}:y={y}:w={w}:h={h}", "-c:v", "libx264", "-qp", "0", str(delogo)], check=True)
+
+    assert cli.main(["clean", str(marked), "--box", ",".join(map(str, BOX)), "--out", str(out)]) == 0
+
+    inside = np.s_[:, y:y + h, x:x + w]
+    ceiling = encode(real, tmp_path / "clean28.mp4", audio=False, crf=28)
+    before, after, theirs, best = (psnr(decode_luma(p, W, H)[inside], truth[inside])
+                                   for p in (marked, out, delogo, ceiling))
+    print(f"inside box vs lossless clean: marked {before:.2f} dB, unmark {after:.2f} dB, delogo {theirs:.2f} dB, "
+          f"clean at crf 28 {best:.2f} dB")
+    assert after >= theirs + 3 and after > before
+    said = capsys.readouterr().out
+    shown = re.search(r"outline visibility \(1\.0 = gone\): input ([\d.]+), output ([\d.]+)", said)
+    assert shown and float(shown[1]) > 1.5 and float(shown[2]) < 1.15 and "still visible" not in said
+
+
+def test_clean_warns_when_the_outline_is_still_visible(tmp_path, capsys, monkeypatch):
+    _, marked = clips(tmp_path)
+    monkeypatch.setattr(marks.Mark, "erase", lambda self, frame: None)  # an erase that removes nothing
+
+    assert cli.main(["clean", str(marked), "--box", ",".join(map(str, BOX)), "--out", str(tmp_path / "out.mp4")]) == 0
+
+    assert "still visible" in capsys.readouterr().out
 
 
 def test_clean_finds_the_overlay_and_removes_the_chosen_mark(tmp_path):
@@ -100,3 +136,23 @@ def test_clean_without_a_terminal_asks_for_mark(tmp_path, capsys, monkeypatch):
 
     said = capsys.readouterr().out
     assert "--mark N" in said and str(tmp_path / "marked.marks.png") in said
+
+
+def test_clean_leaves_frames_without_the_overlay_alone(tmp_path):
+    real = clean_frames(300, W, H, seed=6)
+    intro = len(real) // 5
+    marked_frames = real.copy()
+    marked_frames[intro:] = stamp(real[intro:], text_opacity(W, H, BOX))
+    clean, marked = encode(real, tmp_path / "clean.mp4"), encode(marked_frames, tmp_path / "marked.mp4")
+    out = tmp_path / "out.mp4"
+
+    assert cli.main(["clean", str(marked), "--box", ",".join(map(str, BOX)), "--out", str(out)]) == 0
+
+    c, m, o = (decode_luma(p, W, H) for p in (clean, marked, out))
+    x, y, w, h = BOX
+    inside = np.s_[y:y + h, x:x + w]
+    untouched = [psnr(o[i][inside], m[i][inside]) for i in range(intro)]
+    cleaned = [psnr(o[i][inside], c[i][inside]) for i in range(intro, len(o))]
+    print(f"frames without the overlay, output vs input: worst {min(untouched):.2f} dB; "
+          f"frames with it, output vs clean: worst {min(cleaned):.2f} dB, median {np.median(cleaned):.2f} dB")
+    assert min(untouched) > 40 and min(cleaned) >= 35
