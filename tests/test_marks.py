@@ -1,3 +1,6 @@
+import subprocess
+
+import cv2
 import numpy as np
 from helpers import clean_frames, encode, footage, stamp, text_opacity
 
@@ -52,6 +55,69 @@ def test_find_tells_see_through_text_from_solid_panel_and_ignores_letterbox(tmp_
     solid = [m for m in found if m.kind == "solid"]
     assert len(solid) == 1 and iou(solid[0].box, PANEL) > 0.5
     assert not [m for m in found if m.box[1] < BAR or m.box[1] + m.box[3] > H - BAR]
+
+
+def scenery(frames: np.ndarray, scenes: int, seed: int = 0) -> np.ndarray:
+    """Give each scene of footage its own still, sharp, high-contrast structure, the way test patterns, a game's
+    level or a static shot have: a full-height line, a full-width line (each scene's in a different place) and a few
+    hard blocks, held for that scene."""
+    rng = np.random.default_rng(seed)
+    n, h, w, _ = frames.shape
+    for s, idx in enumerate(np.array_split(np.arange(n), scenes)):
+        part = frames[idx]
+        x, y = w * (2 * s + 1) // (2 * scenes), h * (2 * s + 1) // (2 * scenes)
+        part[:, :, x:x + 3] = rng.choice([10, 245])
+        part[:, y:y + 3] = rng.choice([10, 245])
+        for _ in range(6):
+            bx, by, size = int(rng.integers(0, w - 30)), int(rng.integers(0, h - 30)), int(rng.integers(6, 30))
+            part[:, by:by + size, bx:bx + size] = rng.choice([10, 245])
+        frames[idx] = part
+    return frames
+
+
+def test_find_ignores_structure_held_for_only_one_scene(tmp_path):
+    opacity = text_opacity(W, H, TEXT, peak=0.45)
+    clip = encode(hud(stamp(scenery(clean_frames(300, W, H, seed=7), 5, seed=7), opacity)), tmp_path / "s.mp4",
+                  audio=False)
+
+    found = marks.find(lambda: media.planes(clip, 1000))
+
+    print([(m.kind, m.box, round(m.opacity, 3)) for m in found])
+    assert [m.kind for m in found] == ["see-through", "solid"]
+    assert iou(found[0].box, extent(opacity)) > 0.8 and abs(found[0].opacity - 0.45) <= 0.05
+    assert iou(found[1].box, PANEL) > 0.5
+
+
+def test_find_on_ffmpeg_test_sources_lists_just_the_two_overlays(tmp_path):
+    w, h, seconds = 1280, 720, 6  # per scene
+    text, hud_box = (900, 610), (30, 520, 160, 140)
+    ink = np.zeros((60, 330), np.uint8)
+    cv2.putText(ink, "MyChannel", (6, 44), cv2.FONT_HERSHEY_DUPLEX, 1.4, 255, 3, cv2.LINE_AA)
+    png = np.dstack([np.full((60, 330, 3), 215, np.uint8), (ink * 0.45).astype(np.uint8)])  # light grey, 45%
+    cv2.imwrite(str(tmp_path / "mark.png"), png)
+    opacity = np.zeros((h, w))
+    opacity[text[1]:text[1] + 60, text[0]:text[0] + 330] = png[..., 3] / 255
+    # each scene has still structure of its own (testsrc2's layout, settled cells of life), none lasts the whole video
+    cut = f"trim=duration={seconds},setpts=PTS-STARTPTS,format=yuv420p"
+    scenes = [f"testsrc2=s={w}x{h}:r=10,{cut}", f"mandelbrot=s={w // 2}x{h // 2}:r=10,scale={w}:{h},{cut}",
+              f"life=s={w // 4}x{h // 4}:r=10:seed=1:mold=20:life_color=#ffcc66:death_color=#223344,scale={w}:{h},{cut}",
+              f"perlin=s={w}x{h}:r=10:random_mode=seed:seed=1,eq=contrast=1.4,{cut}"]
+    x, y, bw, bh = hud_box
+    graph = ";".join(f"{s}[s{i}]" for i, s in enumerate(scenes)) + ";" + "".join(f"[s{i}]" for i in range(4)) + (
+        f"concat=n=4:v=1:a=0,drawbox=x={x}:y={y}:w={bw}:h={bh}:color=0x303030:t=fill,"
+        f"drawbox=x={x}:y={y}:w={bw}:h={bh}:color=white:t=4[hud];[hud][0:v]overlay={text[0]}:{text[1]}")
+    clip = tmp_path / "lavfi.mp4"
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(tmp_path / "mark.png"),
+                    "-filter_complex", graph, "-c:v", "libx264", "-crf", "23", "-preset", "veryfast",
+                    "-pix_fmt", "yuv420p", str(clip)], check=True)
+
+    found = marks.find(lambda: media.planes(clip, 1000))
+
+    print([(m.kind, m.box, round(m.opacity, 3)) for m in found])
+    assert [m.kind for m in found] == ["solid", "see-through"]  # the HUD sits higher than the text
+    assert iou(found[0].box, hud_box) > 0.5
+    # measuring, not finding, reads 0.47 to 0.51 here over life and perlin seeds 1 to 6: compression and still scenes
+    assert iou(found[1].box, extent(opacity)) > 0.8 and abs(found[1].opacity - 0.45) <= 0.08
 
 
 def test_find_skips_structure_inside_a_still_part_of_the_scene(tmp_path):

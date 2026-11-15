@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 
 import cv2
@@ -16,19 +16,22 @@ FLAT = 24.0  # luma levels: an overlay whose colour's interquartile spread is be
 APART = 32.0  # luma levels: the flat colour's opacity is solved from the means only this far from the picture behind
 # shortcut: near-solid pixels of a see-through overlay are inverted with keep >= 0.15, upgrade by filling them instead
 FLOOR = 0.15
+PEAK = 10  # percentile of an overlay's keep taken as its peak; the very lowest few are noise or passing scenery
 
-MEAN_EDGE = 3.0  # luma levels per pixel: the averaged picture is smoother than this, a fixed overlay's edge is not
+MEAN_EDGE = 3.0  # luma levels per half-size pixel: a stretch's averaged picture is smoother, a fixed overlay's edge not
 VAR_EDGE = 0.25  # natural-log units per pixel, the same test on the log of the temporal variance
-BOX_PAD = 2  # luma pixels added around a found region
 RING = 8  # luma pixels of surrounding picture compared with a region
 STILL = 4.0  # temporal variance (levels squared) below which the ring is a still scene, so nothing can be measured
 SOLID = 0.05  # overlay variance below this share of the ring's means the overlay hides the picture completely
 LOW = 10  # percentile of a region's variance taken as its overlay pixels; overlays cover at least this share of it
-LARGEST = 0.05  # regions bigger than this share of the frame are scenery, not an overlay
+LARGEST = 0.08  # regions bigger than this share of the frame are scenery, not an overlay
 SPAN = 0.9  # regions this wide or tall relative to the frame are letterbox or pillarbox bars
-SMALLEST = 8  # luma pixels; narrower or shorter regions are specks
+SMALLEST = 0.02  # share of the frame's shorter side; narrower or shorter regions are specks
 NOTHING = "nothing see-through or solid was measured there; check the box, or leave --box out to find overlays"
 CLOSE = 0.02  # gaps up to this share of the frame's shorter side are bridged, so letters join into one region
+# shortcut: an overlay on screen for less than about 70% of the video is not found, upgrade if real ones come and go
+GROUPS = 8  # stretches of the video, at least, whose structure is compared; a scene's own is in few of them
+AGREE = 0.7  # share of those stretches an overlay's outline must be sharp in, with the same sign
 
 
 @dataclass
@@ -141,7 +144,7 @@ def _measure(mean: list[np.ndarray], var: list[np.ndarray], box: tuple[int, int,
         unknown = inside & cv2.dilate(overlay.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
         keep = np.where(unknown, np.sqrt(v0 / np.maximum(_fill(v0, unknown), 1e-6)), 1.0).clip(0, 1)
         overlay = inside & (keep < OVERLAY)
-    opacity = float(1 - keep[overlay].min()) if overlay.any() else 0.0
+    opacity = float(1 - np.percentile(keep[overlay], PEAK)) if overlay.any() else 0.0
     behind = _fill(m0, unknown)
     core = overlay & (1 - keep > opacity / 2)
     if core.any():
@@ -151,7 +154,7 @@ def _measure(mean: list[np.ndarray], var: list[np.ndarray], box: tuple[int, int,
             apart = np.abs(c - behind) >= APART  # elsewhere that division is mostly noise, so the ratio's keep stays
             keep = np.where(unknown & apart, 1 - ((m0 - behind) / np.where(apart, c - behind, 1)).clip(0, 1), keep)
             overlay = inside & (keep < OVERLAY)
-            opacity = float(1 - keep[overlay].min()) if overlay.any() else 0.0
+            opacity = float(1 - np.percentile(keep[overlay], PEAK)) if overlay.any() else 0.0
     keep = np.maximum(keep, FLOOR)
     offset = m0 - keep * behind
 
@@ -173,44 +176,79 @@ def _edges(img: np.ndarray) -> np.ndarray:
     return np.hypot(gx, gy)
 
 
-def _regions(mean: np.ndarray, var: np.ndarray) -> list[tuple[int, int, int, int]]:
-    """Boxes around the sharp structure a fixed overlay leaves in the averaged picture or its variance."""
-    height, width = mean.shape
-    sharp = (_edges(mean.astype(np.float32)) > MEAN_EDGE) | (_edges(np.log(var + 1).astype(np.float32)) > VAR_EDGE)
-    k = max(3, round(CLOSE * min(width, height))) | 1
+def _grouped(frames: Iterable[Frame], chunks: list[list]) -> Iterator[Frame]:
+    """Pass frames on, adding each one's half-size luma to chunks: [count, sum, sum of squares] for each of GROUPS to
+    2 * GROUPS stretches of the video in order, all as long as each other but the last."""
+    size = 1
+    for f in frames:
+        if not chunks or chunks[-1][0] == size:
+            if len(chunks) == 2 * GROUPS:  # the number of frames is not known ahead, so neighbours merge as they come
+                chunks[:] = [[a + b for a, b in zip(*pair)] for pair in zip(chunks[::2], chunks[1::2])]
+                size *= 2
+            h, w = f.y.shape[0] // 2, f.y.shape[1] // 2
+            chunks.append([0, np.zeros((h, w), np.uint32), np.zeros((h, w), np.uint32)])
+        y = cv2.resize(f.y, chunks[-1][1].shape[::-1], interpolation=cv2.INTER_AREA)
+        chunks[-1][0] += 1
+        chunks[-1][1] += y
+        chunks[-1][2] += np.square(y, dtype=np.uint32)
+        yield f
+
+
+def _lasting_edges(maps: list[np.ndarray]) -> np.ndarray:
+    """Per pixel, the gradient magnitude that at least AGREE of maps share, sign included, in x and in y."""
+    parts = []
+    for dx in (1, 0):
+        g = np.empty((len(maps), *maps[0].shape), np.float32)  # filled and sorted in place to keep memory down
+        for i, m in enumerate(maps):
+            g[i] = cv2.Sobel(m, cv2.CV_32F, dx, 1 - dx) / 8
+        g.sort(axis=0)
+        low, high = g[int((1 - AGREE) * (len(g) - 1))], g[-1 - int((1 - AGREE) * (len(g) - 1))]
+        parts.append(np.maximum(np.maximum(low, -high), 0))
+    return np.hypot(*parts)
+
+
+def _regions(chunks: list[list], height: int, width: int) -> list[tuple[int, int, int, int]]:
+    """Boxes (luma pixels of a height x width frame) around the sharp structure a fixed overlay leaves in the averaged
+    picture or its variance in most stretches of the video; a scene's own structure is in only some of them."""
+    sharp = _lasting_edges([(s / n).astype(np.float32) for n, s, _ in chunks]) > MEAN_EDGE
+    sharp |= _lasting_edges([np.log(np.maximum(q / n - (s / n) ** 2, 0) + 1).astype(np.float32)
+                             for n, s, q in chunks]) > VAR_EDGE
+    h, w = sharp.shape
+    k = max(3, round(CLOSE * min(w, h))) | 1
     sharp = cv2.morphologyEx(sharp.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
     n, _, stats, _ = cv2.connectedComponentsWithStats(sharp)
     boxes = []
-    for x, y, w, h, _ in stats[1:n]:
-        if w * h > LARGEST * width * height or w >= SPAN * width or h >= SPAN * height or min(w, h) < SMALLEST:
+    for x, y, bw, bh, _ in stats[1:n]:
+        if bw * bh > LARGEST * w * h or bw >= SPAN * w or bh >= SPAN * h or min(bw, bh) < SMALLEST * min(w, h):
             continue
-        x0, y0 = max(0, x - BOX_PAD) & ~1, max(0, y - BOX_PAD) & ~1
-        x1, y1 = min(width & ~1, x + w + BOX_PAD + 1 & ~1), min(height & ~1, y + h + BOX_PAD + 1 & ~1)
-        boxes.append((int(x0), int(y0), int(x1 - x0), int(y1 - y0)))
+        # the gradient already reaches a half-size pixel (two luma pixels) past the outline, so no padding is added
+        boxes.append((int(2 * x), int(2 * y), int(min(width & ~1, 2 * (x + bw)) - 2 * x),
+                      int(min(height & ~1, 2 * (y + bh)) - 2 * y)))
     return boxes
 
 
 def find(frames: Callable[[], Iterable[Frame]], box: tuple[int, int, int, int] | None = None) -> list[Mark]:
     """Every fixed overlay in full-size frames, each measured once (enough to list them); with box (even-aligned luma
     pixels), just that one, refined. frames() gives a fresh run of the same frames each call."""
-    found = _first(*_stats(frames()), box)
-    return [found[0].refined(frames())] if box else found
+    if box:
+        return [_classify(*_stats(frames()), box, True).refined(frames())]
+    chunks = []
+    mean, var = _stats(_grouped(frames(), chunks))
+    boxes = sorted(_regions(chunks, *mean[0].shape), key=lambda b: (b[1], b[0]))  # top to bottom, then left to right
+    return [m for m in (_classify(mean, var, b, False) for b in boxes) if m]
 
 
-def _first(mean: list[np.ndarray], var: list[np.ndarray], box: tuple[int, int, int, int] | None) -> list[Mark]:
-    """The overlays as measured on all frames; a given box is told solid or see-through the same way."""
-    found = []
-    # top to bottom, then left to right
-    for b in [box] if box else sorted(_regions(mean[0], var[0]), key=lambda b: (b[1], b[0])):
-        x, y, w, h = b
-        x0, y0 = max(0, x - RING), max(0, y - RING)
-        around = var[0][y0:y + h + RING, x0:x + w + RING].copy()
-        around[y - y0:y - y0 + h, x - x0:x - x0 + w] = np.nan
-        ring = np.nanmedian(around)
-        if ring < STILL and not box:
-            continue
-        if np.percentile(var[0][y:y + h, x:x + w], LOW) < SOLID * ring:
-            found.append(_solid(b, var[0], ring))
-        else:
-            found.append(_measure(mean, var, b))
-    return found
+def _classify(mean: list[np.ndarray], var: list[np.ndarray], box: tuple[int, int, int, int], given: bool
+              ) -> Mark | None:
+    """The overlay in box as measured on all frames, solid or see-through; None for a found (not given) box in a
+    still part of the picture, where nothing can be measured."""
+    x, y, w, h = box
+    x0, y0 = max(0, x - RING), max(0, y - RING)
+    around = var[0][y0:y + h + RING, x0:x + w + RING].copy()
+    around[y - y0:y - y0 + h, x - x0:x - x0 + w] = np.nan
+    ring = np.nanmedian(around)
+    if ring < STILL and not given:
+        return None
+    if np.percentile(var[0][y:y + h, x:x + w], LOW) < SOLID * ring:
+        return _solid(box, var[0], ring)
+    return _measure(mean, var, box)
