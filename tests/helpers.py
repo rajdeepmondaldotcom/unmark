@@ -84,12 +84,16 @@ def encode(frames: np.ndarray, path: Path, fps: int = 30, audio: bool = True, cr
     return Path(path)
 
 
-def decode_luma(path: Path, w: int, h: int) -> np.ndarray:
-    """Every frame's luma plane as (n, h, w) uint8."""
+def decode(path: Path, w: int, h: int) -> np.ndarray:
+    """Every frame as raw yuv420p bytes, (n, w * h * 3 // 2) uint8 for even w and h."""
     raw = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(path), "-f", "rawvideo",
                           "-pix_fmt", "yuv420p", "-"], capture_output=True, check=True).stdout
-    size = w * h + 2 * ((w + 1) // 2) * ((h + 1) // 2)
-    return np.frombuffer(raw, np.uint8).reshape(-1, size)[:, :w * h].reshape(-1, h, w)
+    return np.frombuffer(raw, np.uint8).reshape(-1, w * h * 3 // 2)
+
+
+def decode_luma(path: Path, w: int, h: int) -> np.ndarray:
+    """Every frame's luma plane as (n, h, w) uint8."""
+    return decode(path, w, h)[:, :w * h].reshape(-1, h, w)
 
 
 def has_audio(path: Path) -> bool:
@@ -103,3 +107,16 @@ def psnr(a: np.ndarray, b: np.ndarray) -> float:
     """Peak signal-to-noise ratio in dB for 8-bit data."""
     mse = np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2)
     return float("inf") if mse == 0 else 10 * np.log10(255 ** 2 / mse)
+
+
+def smooth(n: int, w: int = 320, h: int = 180, seed: int = 0) -> np.ndarray:
+    """n RGB frames (n, h, w, 3) uint8 of soft colour waves drifting about a pixel per frame, their look set by seed."""
+    rng = np.random.default_rng(seed)
+    level, periods, phases = rng.uniform(70, 180), rng.uniform(30, 90, (3, 2)), rng.uniform(0, 6, 3)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    out = np.empty((n, h, w, 3), np.uint8)
+    for i in range(n):
+        for c, ((fx, fy), p) in enumerate(zip(periods, phases)):
+            wave = np.sin((xx + i) / fx + p) + np.sin((yy + i / 2) / fy)  # no still rows or columns
+            out[i, ..., c] = np.clip(level + 35 * wave, 0, 255).round()
+    return out

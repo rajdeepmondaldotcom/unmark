@@ -80,3 +80,19 @@ def test_visibility_tells_a_stamped_outline_from_the_picture_and_a_cleaned_one(t
     print(f"visibility: marked {seen:.2f}, clean {truth:.2f}, cleaned {out:.2f}")
     assert seen > 1.5
     assert abs(truth - 1) < 0.15 and abs(out - 1) < 0.15
+
+
+def test_finding_reads_the_frames_once_and_a_given_box_twice(tmp_path):
+    two = text_opacity(W, H, TEXT) + text_opacity(W, H, (24, 110, 96, 48), "OK")
+    clip = encode(stamp(clean_frames(150, W, H, seed=2), two), tmp_path / "two.mp4", audio=False)
+    reads = []
+
+    def frames():
+        reads.append(1)
+        return media.planes(clip, 1000)
+
+    found = marks.find(frames)
+    assert [m.kind for m in found] == ["see-through", "see-through"] and len(reads) == 1
+    reads.clear()
+    marks.find(frames, found[1].box)
+    assert len(reads) == 2  # once to measure, once more on only the frames the overlay is in

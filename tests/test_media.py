@@ -228,3 +228,42 @@ def test_planes_on_late_video_does_not_repeat_its_first_frame(tmp_path):
     ys = frames[:, :W * H].reshape(-1, H, W)
     got = [next(i for i in range(25) if (ys[i] == f.y).all()) for f in media.planes(src, 5)]
     assert len(set(got)) == len(got) >= 4 and got[-1] >= 18, got
+
+
+def test_crops_line_up_with_the_frames_patch_edits(tmp_path):
+    video = make(tmp_path / "v.mkv", noise(25, seed=6))
+    late = tmp_path / "late.mkv"
+    ff("-itsoffset", "0.5", "-i", str(video), "-f", "lavfi", "-i", "sine=duration=2", "-map", "0:v", "-map", "1:a",
+       "-c:v", "copy", "-c:a", "aac", str(late))
+    keep = "+".join(f"eq(mod(n\\,24)\\,{k})" for k in (0, 4, 12))
+    vfr = make(tmp_path / "vfr.mkv", noise(100, seed=7), fps=100, extra=("-vf", f"select='{keep}'", "-fps_mode", "vfr"))
+    x, y, w, h = 8, 6, 24, 16
+    luma, chroma = np.s_[y:y + h, x:x + w], np.s_[y // 2:(y + h) // 2, x // 2:(x + w) // 2]
+    for src in (late, vfr):
+        seen = []
+        media.patch(src, tmp_path / "out.mkv", lambda f, seen=seen: seen.append((f.y[luma].copy(), f.v[chroma].copy())))
+        got = [(f.y.copy(), f.v.copy()) for f in media.crops(src, (x, y, w, h))]
+        assert len(got) == len(seen) > 0, src.name
+        assert all((a == c).all() and (b == d).all() for (a, b), (c, d) in zip(got, seen)), src.name
+
+
+def drift(n: int, fx: float, level: int, speed: float = 0.1) -> np.ndarray:
+    """n yuv frames of a soft luma pattern sliding speed pixels per frame, grey chroma."""
+    yy, xx = np.mgrid[:H, :W]
+    frames = np.full((n, SIZE), 128, np.uint8)
+    for i in range(n):
+        frames[i, :W * H] = np.clip(level + 50 * np.sin((xx + i * speed) / fx) * np.cos(yy / 11), 0, 255).ravel()
+    return frames
+
+
+def test_cuts_finds_a_hard_cut_in_patch_numbering(tmp_path):
+    keep = "+".join(f"eq(mod(n\\,24)\\,{k})" for k in (0, 4, 12))  # variable rate, so numbering is easy to get wrong
+    for name, frames in (("cut.mkv", np.concatenate([drift(100, 7, 80), drift(100, 13, 170)])),
+                         ("smooth.mkv", drift(200, 7, 120))):
+        src = make(tmp_path / name, frames, fps=100, extra=("-vf", f"select='{keep}'", "-fps_mode", "vfr"))
+        levels = []
+        media.patch(src, tmp_path / "out.mkv", lambda f, levels=levels: levels.append(f.y.mean()))
+        want = [i for i in range(1, len(levels)) if (levels[i - 1] < 125) != (levels[i] < 125)]
+        got = media.cuts(src)
+        assert len(got) == len(want) == (name == "cut.mkv") and all(abs(g - c) <= 1 for g, c in zip(got, want)), \
+            (name, got, want)

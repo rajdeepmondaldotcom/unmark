@@ -1,37 +1,45 @@
+import json
 import re
 import subprocess
+import sys
+from functools import partial
+from pathlib import Path
 
 import numpy as np
+import pytest
 from helpers import (
     clean_frames,
+    decode,
     decode_luma,
     encode,
     footage,
     has_audio,
     psnr,
+    smooth,
     stamp,
     text_opacity,
 )
 
-from unmark import cli, marks
+from unmark import cli, fill, marks, media
 
 W, H = 320, 180
 BOX = (208, 16, 96, 48)  # near the top-right corner, like a typical logo
 MARGIN = 32  # at least the tool's own padding
+PANEL = (32, 100, 64, 40)  # an opaque panel, lower left
 
 
-def check_cleaned(clean, marked, out):
-    """The output matches the clean clip inside BOX and the marked clip well away from it."""
+def check_cleaned(clean, marked, out, box=BOX, bar=35):
+    """The output matches the clean clip inside box and the marked clip well away from it."""
     c, m, o = (decode_luma(p, W, H) for p in (clean, marked, out))
     assert len(o) == len(m)
-    x, y, w, h = BOX
+    x, y, w, h = box
     inside = np.s_[:, y:y + h, x:x + w]
     before, after = psnr(m[inside], c[inside]), psnr(o[inside], c[inside])
     far = np.ones((H, W), bool)
     far[max(0, y - MARGIN):y + h + MARGIN, max(0, x - MARGIN):x + w + MARGIN] = False
     untouched = psnr(o[:, far], m[:, far])
     print(f"inside box: marked {before:.2f} dB, output {after:.2f} dB; outside region: {untouched:.2f} dB")
-    assert after >= 35 and after >= before + 10
+    assert after >= bar and after >= before + 10
     assert untouched > 40
     assert has_audio(out)
 
@@ -45,6 +53,18 @@ def test_clean_removes_see_through_overlay(tmp_path):
     clean, marked = clips(tmp_path)
     out = tmp_path / "out.mp4"
     assert cli.main(["clean", str(marked), "--box", ",".join(map(str, BOX)), "--out", str(out)]) == 0
+    check_cleaned(clean, marked, out)
+
+
+def test_clean_removes_an_overlay_the_colour_of_the_average_picture(tmp_path):
+    real = clean_frames(150, W, H, seed=1)
+    grey = float(real.mean())  # the overlay's colour minus the picture behind it averages to about zero
+    clean, marked = encode(real, tmp_path / "clean.mp4"), encode(stamp(real, text_opacity(W, H, BOX), grey),
+                                                                   tmp_path / "marked.mp4")
+    out = tmp_path / "out.mp4"
+
+    assert cli.main(["clean", str(marked), "--box", ",".join(map(str, BOX)), "--out", str(out)]) == 0
+
     check_cleaned(clean, marked, out)
 
 
@@ -115,16 +135,80 @@ def test_clean_says_when_the_mark_number_is_not_listed(tmp_path, capsys):
     assert "there is no overlay 2" in capsys.readouterr().out
 
 
-def test_clean_refuses_a_solid_mark(tmp_path, capsys):
-    frames = clean_frames(150, W, H, seed=4)
-    frames[:, 100:140, 30:90] = 230  # an opaque white panel
-    solid = encode(frames, tmp_path / "solid.mp4")
+def solid_clips(tmp_path, frames):
+    """The clean clip and the same with an opaque white panel over PANEL."""
+    marked = frames.copy()
+    x, y, w, h = PANEL
+    marked[:, y:y + h, x:x + w] = 230
+    return encode(frames, tmp_path / "clean.mp4"), encode(marked, tmp_path / "solid.mp4")
+
+
+def test_clean_fills_a_solid_mark(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("UNMARK_PROPAINTER", raising=False)
+    clean, solid = solid_clips(tmp_path, smooth(150, W, H, seed=1))
     out = tmp_path / "out.mp4"
 
-    assert cli.main(["clean", str(solid), "--mark", "1", "--out", str(out)]) == 1
+    assert cli.main(["clean", str(solid), "--mark", "1", "--out", str(out)]) == 0
 
     said = capsys.readouterr().out
-    assert "1: solid" in said and "solid marks is not supported yet" in said
+    check_cleaned(clean, solid, out, PANEL, bar=28)  # 30.5 to 33.9 dB measured over seeds 1 to 5
+    assert "1: solid" in said and "softer" in said
+    shown = re.search(r"outline visibility \(1\.0 = gone\): input ([\d.]+), output ([\d.]+)", said)
+    assert shown and float(shown[1]) > 10 and float(shown[2]) < cli.VISIBLE and "still visible" not in said
+
+
+def test_clean_fills_a_solid_mark_with_propainter_one_scene_at_a_time(tmp_path, capsys, monkeypatch):
+    log = tmp_path / "runs.jsonl"
+    monkeypatch.setenv("UNMARK_PROPAINTER", str(Path(__file__).parent / "fake_propainter"))
+    monkeypatch.setenv("UNMARK_PROPAINTER_PYTHON", sys.executable)
+    monkeypatch.setenv("FAKE_PROPAINTER_LOG", str(log))
+    cut = 70
+    clean, solid = solid_clips(tmp_path, np.concatenate([smooth(cut, W, H, seed=1), smooth(80, W, H, seed=2)]))
+    out = tmp_path / "out.mp4"
+
+    assert cli.main(["clean", str(solid), "--mark", "1", "--out", str(out)]) == 0
+
+    assert "softer" not in capsys.readouterr().out
+    check_cleaned(clean, solid, out, PANEL, bar=28)
+    found = media.cuts(solid)
+    assert len(found) == 1 and abs(found[0] - cut) <= 1, found
+    sizes = [json.loads(line)["frames"] for line in log.read_text().splitlines()]
+    starts = np.cumsum([0, *sizes])  # the clip is shorter than one piece, so pieces only split at cuts
+    assert starts[-1] == 150 and found[0] in starts, sizes
+
+
+def test_a_given_box_on_a_solid_mark_is_filled_and_nothing_else_changes(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("UNMARK_PROPAINTER", raising=False)
+    monkeypatch.setattr(media, "patch", partial(media.patch, crf=0))  # lossless, so untouched means byte-identical
+    # saturated, so some colours do not survive a trip through RGB and back: only what the fill changed may be pasted
+    vivid = np.clip((smooth(150, W, H, seed=3).astype(np.float32) - 128) * 3 + 128, 0, 255).astype(np.uint8)
+    clean, solid = solid_clips(tmp_path, vivid)
+    out = tmp_path / "out.mp4"
+
+    assert cli.main(["clean", str(solid), "--box", ",".join(map(str, PANEL)), "--out", str(out)]) == 0
+
+    assert "softer" in capsys.readouterr().out
+    check_cleaned(clean, solid, out, PANEL, bar=28)
+    x, y, w, h = PANEL
+    reach = fill.GROW + fill.FEATHER + 2  # the fill's feathered edge, plus the colour pixel it shares
+    far = np.ones((H, W), bool)
+    far[y - reach:y + h + reach, x - reach:x + w + reach] = False
+    o, m = (decode(p, W, H) for p in (out, solid))
+    for plane, size, keep in ((0, W * H, far), (1, W * H // 4, far[::2, ::2]), (2, W * H // 4, far[::2, ::2])):
+        start = 0 if plane == 0 else W * H + (plane - 1) * size
+        a, b = (f[:, start:start + size].reshape(len(f), *keep.shape) for f in (o, m))
+        assert (a[:, keep] == b[:, keep]).all(), plane
+
+
+def test_a_given_box_with_nothing_in_it_is_refused_in_plain_words(tmp_path, capsys):
+    _, marked = clips(tmp_path)  # the overlay is top right; PANEL, lower left, has only moving picture in it
+    out = tmp_path / "out.mp4"
+
+    assert cli.main(["clean", str(marked), "--box", ",".join(map(str, PANEL)), "--out", str(out)]) == 1
+
+    said = capsys.readouterr().out
+    print(said)
+    assert "nothing see-through or solid" in said and said.count("\n") == 1
     assert not out.exists()
 
 
@@ -138,7 +222,8 @@ def test_clean_without_a_terminal_asks_for_mark(tmp_path, capsys, monkeypatch):
     assert "--mark N" in said and str(tmp_path / "marked.marks.png") in said
 
 
-def test_clean_leaves_frames_without_the_overlay_alone(tmp_path):
+@pytest.mark.parametrize("where", [["--box", ",".join(map(str, BOX))], ["--mark", "1"]])
+def test_clean_leaves_frames_without_the_overlay_alone(tmp_path, where):
     real = clean_frames(300, W, H, seed=6)
     intro = len(real) // 5
     marked_frames = real.copy()
@@ -146,7 +231,7 @@ def test_clean_leaves_frames_without_the_overlay_alone(tmp_path):
     clean, marked = encode(real, tmp_path / "clean.mp4"), encode(marked_frames, tmp_path / "marked.mp4")
     out = tmp_path / "out.mp4"
 
-    assert cli.main(["clean", str(marked), "--box", ",".join(map(str, BOX)), "--out", str(out)]) == 0
+    assert cli.main(["clean", str(marked), *where, "--out", str(out)]) == 0
 
     c, m, o = (decode_luma(p, W, H) for p in (clean, marked, out))
     x, y, w, h = BOX

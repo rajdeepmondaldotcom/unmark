@@ -20,6 +20,10 @@ FORMATS = {"yuv420p", "yuvj420p"}
 COLOURS = {"color_range": "-color_range", "color_space": "-colorspace", "color_primaries": "-color_primaries",
            "color_transfer": "-color_trc"}
 MUXERS = {".mp4": "mp4", ".mov": "mov", ".mkv": "matroska"}
+CUT_WIDTH = 160  # pixels; scene cuts are looked for on a picture this wide, which is plenty and cheap
+# shortcut: scdet score (0-100) above which a frame starts a new scene, set on synthetic clips (a soft cut scores 8.9,
+# smooth motion 0.1; ffmpeg's default 10 misses that cut), upgrade by calibrating on real game footage
+CUT_SCORE = 5
 
 
 @dataclass
@@ -137,8 +141,35 @@ def planes(src, count: int, box: tuple[int, int, int, int] | None = None) -> Ite
     if box:
         x, y, w, h = box
         filters.append(f"crop={w}:{h}:{x}:{y}")
+    yield from _stream(src, info["pix_fmt"], ",".join(filters) or "null", w, h)
+
+
+def _every(info: dict) -> str:
+    """The filters patch decodes with: fps makes variable-rate input constant; starting at 0 stops it padding a late
+    start with copies of frame 0."""
+    return f"setpts=PTS-STARTPTS,fps={info['fps']}"
+
+
+def crops(src, box: tuple[int, int, int, int]) -> Iterator[Frame]:
+    """Every frame exactly as patch passes it to edit, cropped to box (x, y, w, h, even); each valid until the next."""
+    src = Path(src)
+    info = probe(src)
+    x, y, w, h = box
+    yield from _stream(src, info["pix_fmt"], f"{_every(info)},crop={w}:{h}:{x}:{y}", w, h)
+
+
+def cuts(src) -> list[int]:
+    """Numbers of the frames where a new scene starts, counted the way patch counts them."""
+    src = Path(src)
+    vf = f"{_every(probe(src))},scale={CUT_WIDTH}:-2,scdet=threshold={CUT_SCORE}"
+    out = _run([_bin("ffmpeg"), "-hide_banner", "-nostdin", "-loglevel", "error", "-i", str(src), "-map", "0:v:0",
+                "-vf", f"{vf},metadata=mode=print:key=lavfi.scd.time:file=-", "-f", "null", "-"]).stdout
+    return [int(line.split()[0][6:]) for line in out.splitlines() if line.startswith("frame:")]
+
+
+def _stream(src: Path, pix_fmt: str, vf: str, w: int, h: int) -> Iterator[Frame]:
     with tempfile.TemporaryFile() as log:
-        p = _decode(src, info["pix_fmt"], ",".join(filters) or "null", log)
+        p = _decode(src, pix_fmt, vf, log)
         try:
             for _, frame in _frames(p, w, h):
                 yield frame
@@ -167,8 +198,7 @@ def patch(src, dst, edit: Callable[[Frame], None], crf: int = 16) -> int:
     n = 0
     try:
         with tempfile.TemporaryFile() as dlog, tempfile.TemporaryFile() as elog:
-            # fps makes variable-rate input constant; starting at 0 stops it padding a late start with copies of frame 0
-            dec = _decode(src, pf, f"setpts=PTS-STARTPTS,fps={info['fps']}", dlog)
+            dec = _decode(src, pf, _every(info), dlog)
             enc = _popen(enc_args, elog, stdin=subprocess.PIPE)
             try:
                 for buf, frame in _frames(dec, w, h):

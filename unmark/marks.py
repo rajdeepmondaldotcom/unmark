@@ -13,7 +13,9 @@ from unmark.media import Frame
 PAD = 16  # luma pixels of plain background kept around the box to interpolate from
 OVERLAY = 0.97  # keep below this counts as overlay; plain background measures within a percent or two of 1
 FLAT = 24.0  # luma levels: an overlay whose colour's interquartile spread is below this is one flat colour
-FLOOR = 0.15  # shortcut: near-solid pixels are inverted with keep >= 0.15, upgrade when solid overlays get their own fill
+APART = 32.0  # luma levels: the flat colour's opacity is solved from the means only this far from the picture behind
+# shortcut: near-solid pixels of a see-through overlay are inverted with keep >= 0.15, upgrade by filling them instead
+FLOOR = 0.15
 
 MEAN_EDGE = 3.0  # luma levels per pixel: the averaged picture is smoother than this, a fixed overlay's edge is not
 VAR_EDGE = 0.25  # natural-log units per pixel, the same test on the log of the temporal variance
@@ -25,13 +27,15 @@ LOW = 10  # percentile of a region's variance taken as its overlay pixels; overl
 LARGEST = 0.05  # regions bigger than this share of the frame are scenery, not an overlay
 SPAN = 0.9  # regions this wide or tall relative to the frame are letterbox or pillarbox bars
 SMALLEST = 8  # luma pixels; narrower or shorter regions are specks
+NOTHING = "nothing see-through or solid was measured there; check the box, or leave --box out to find overlays"
 CLOSE = 0.02  # gaps up to this share of the frame's shorter side are bridged, so letters join into one region
 
 
 @dataclass
 class Mark:
     """A fixed overlay: its box (x, y, w, h, even-aligned luma pixels), kind, peak opacity, and per plane where it
-    sits in the full frame, which pixels it covers, and keep / offset (empty for a solid mark)."""
+    sits in the full frame, which pixels it covers, and keep / offset (a solid mark: luma only, its unchanging
+    pixels, empty keep / offset)."""
     box: tuple[int, int, int, int]
     kind: str
     opacity: float
@@ -41,8 +45,7 @@ class Mark:
         """Clean one full-size frame in place, unless that would leave the overlay's outline sharper than it was (so
         the overlay is not in this frame); pixels outside the overlay are left exactly as they were."""
         if self.kind == "solid":
-            raise RuntimeError("this mark is solid (it hides the picture completely), and removing solid marks is not "
-                               "supported yet")
+            raise RuntimeError("a solid mark hides the picture completely, so it is filled in, not erased")
         real = self._luma(frame)
         if real is None:
             return
@@ -59,6 +62,15 @@ class Mark:
         real[sel] = np.clip(np.rint((seen[sel] - offset) / keep), 0, 255)
         outline = _outline(sel)[0]
         return real if _edges(real)[outline].mean() < _edges(seen)[outline].mean() else None
+
+    def refined(self, frames: Iterable[Frame]) -> Mark:
+        """This see-through mark measured again on only the frames it is in, so frames without it (an intro, say) do
+        not water the measurement down; a solid mark is returned as it is."""
+        if self.kind == "solid":
+            return self
+        if not self.parts[0][1].any():
+            raise RuntimeError(NOTHING)
+        return _measure(*_stats((f for f in frames if self._luma(f) is not None), NOTHING), self.box)
 
     def visibility(self, frames: Iterable[Frame]) -> float:
         """Average luma gradient on the overlay's outline over that on nearby picture; 1.0 means the outline is gone."""
@@ -83,8 +95,9 @@ def _fill(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return cv2.inpaint(img.astype(np.float32), mask.astype(np.uint8), 5, cv2.INPAINT_TELEA)
 
 
-def _stats(frames: Iterable[Frame]) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """Per plane, the temporal mean and variance of frames, from exact integer sums."""
+def _stats(frames: Iterable[Frame], few: str = "the video has too few frames to measure the overlay"
+           ) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Per plane, the temporal mean and variance of frames, from exact integer sums; fewer than two raise few."""
     sums = sq = None
     n = 0
     for f in frames:
@@ -97,23 +110,32 @@ def _stats(frames: Iterable[Frame]) -> tuple[list[np.ndarray], list[np.ndarray]]
             q += np.square(p, dtype=np.uint32)
         n += 1
     if n < 2:
-        raise RuntimeError("the video has too few frames to measure the overlay")
+        raise RuntimeError(few)
     mean = [s / n for s in sums]
     return mean, [np.maximum(q / n - m * m, 0) for q, m in zip(sq, mean)]
 
 
-def _measure(mean: list[np.ndarray], var: list[np.ndarray], box: tuple[int, int, int, int]) -> Mark:
-    """Measure the see-through overlay inside box from full-frame temporal mean and variance."""
-    height, width = mean[0].shape
+def _area(box: tuple[int, int, int, int], height: int, width: int) -> tuple[tuple, tuple, np.ndarray]:
+    """The luma and chroma slices of box padded by PAD, and which pixels of that area are inside box."""
     x, y, w, h = box
     ax, ay = max(0, x - PAD), max(0, y - PAD)
     aw, ah = min(width & ~1, x + w + PAD) - ax, min(height & ~1, y + h + PAD) - ay
-    luma = np.s_[ay:ay + ah, ax:ax + aw]
-    chroma = np.s_[ay // 2:(ay + ah) // 2, ax // 2:(ax + aw) // 2]
-    m0, v0 = mean[0][luma], np.maximum(var[0][luma], 1e-6)
-
     inside = np.zeros((ah, aw), bool)
     inside[y - ay:y - ay + h, x - ax:x - ax + w] = True
+    return np.s_[ay:ay + ah, ax:ax + aw], np.s_[ay // 2:(ay + ah) // 2, ax // 2:(ax + aw) // 2], inside
+
+
+def _solid(box: tuple[int, int, int, int], var: np.ndarray, ring: float) -> Mark:
+    """A solid mark; the pixels of its box that barely change are its outline for visibility."""
+    luma, _, inside = _area(box, *var.shape)
+    return Mark(box, "solid", 1.0, [(luma, inside & (var[luma] < SOLID * ring), np.empty(0), np.empty(0))])
+
+
+def _measure(mean: list[np.ndarray], var: list[np.ndarray], box: tuple[int, int, int, int]) -> Mark:
+    """Measure the see-through overlay inside box from full-frame temporal mean and variance."""
+    luma, chroma, inside = _area(box, *mean[0].shape)
+    ah, aw = inside.shape
+    m0, v0 = mean[0][luma], np.maximum(var[0][luma], 1e-6)
     overlay = inside
     for _ in range(3):  # each later pass interpolates from background that sits closer to the overlay
         unknown = inside & cv2.dilate(overlay.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
@@ -126,7 +148,8 @@ def _measure(mean: list[np.ndarray], var: list[np.ndarray], box: tuple[int, int,
         colour = (m0[core] - keep[core] * behind[core]) / (1 - keep[core])
         q1, c, q3 = np.percentile(colour, [25, 50, 75])
         if q3 - q1 < FLAT:  # one flat colour: re-solve opacity from the means, far less noisy than the variance ratio
-            keep = np.where(unknown, 1 - ((m0 - behind) / (c - behind)).clip(0, 1), 1.0)
+            apart = np.abs(c - behind) >= APART  # elsewhere that division is mostly noise, so the ratio's keep stays
+            keep = np.where(unknown & apart, 1 - ((m0 - behind) / np.where(apart, c - behind, 1)).clip(0, 1), keep)
             overlay = inside & (keep < OVERLAY)
             opacity = float(1 - keep[overlay].min()) if overlay.any() else 0.0
     keep = np.maximum(keep, FLOOR)
@@ -168,30 +191,26 @@ def _regions(mean: np.ndarray, var: np.ndarray) -> list[tuple[int, int, int, int
 
 
 def find(frames: Callable[[], Iterable[Frame]], box: tuple[int, int, int, int] | None = None) -> list[Mark]:
-    """Every fixed overlay in full-size frames, each measured; with box (even-aligned luma pixels), just that one.
-    frames() gives a fresh run of the same frames each call: each see-through overlay is measured a second time on
-    only the frames it is in, so frames without it (an intro, say) do not water the measurement down."""
-    mean, var = _stats(frames())
-    # shortcut: the second measurement reads the frames again per overlay, upgrade to one shared pass if that is slow
-    return [_measure(*_stats(f for f in frames() if m._luma(f) is not None), m.box)
-            if m.kind == "see-through" and m.parts[0][1].any() else m for m in _first(mean, var, box)]
+    """Every fixed overlay in full-size frames, each measured once (enough to list them); with box (even-aligned luma
+    pixels), just that one, refined. frames() gives a fresh run of the same frames each call."""
+    found = _first(*_stats(frames()), box)
+    return [found[0].refined(frames())] if box else found
 
 
 def _first(mean: list[np.ndarray], var: list[np.ndarray], box: tuple[int, int, int, int] | None) -> list[Mark]:
-    """The overlays as measured on all frames."""
-    if box:
-        return [_measure(mean, var, box)]
+    """The overlays as measured on all frames; a given box is told solid or see-through the same way."""
     found = []
-    for b in sorted(_regions(mean[0], var[0]), key=lambda b: (b[1], b[0])):  # top to bottom, then left to right
+    # top to bottom, then left to right
+    for b in [box] if box else sorted(_regions(mean[0], var[0]), key=lambda b: (b[1], b[0])):
         x, y, w, h = b
         x0, y0 = max(0, x - RING), max(0, y - RING)
         around = var[0][y0:y + h + RING, x0:x + w + RING].copy()
         around[y - y0:y - y0 + h, x - x0:x - x0 + w] = np.nan
         ring = np.nanmedian(around)
-        if ring < STILL:
+        if ring < STILL and not box:
             continue
         if np.percentile(var[0][y:y + h, x:x + w], LOW) < SOLID * ring:
-            found.append(Mark(b, "solid", 1.0))
+            found.append(_solid(b, var[0], ring))
         else:
             found.append(_measure(mean, var, b))
     return found
