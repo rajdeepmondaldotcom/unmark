@@ -1,14 +1,21 @@
-"""Command line: `unmark clean VIDEO --box x,y,w,h [--out PATH]`."""
+"""Command line: `unmark clean VIDEO [--box x,y,w,h | --mark N] [--out PATH]`."""
 
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
 import sys
+from collections.abc import Iterable, Iterator
 from pathlib import Path
+
+import cv2
+import numpy as np
 
 from unmark import marks, media
 
-SAMPLES = 400  # frames measured; more average out the picture, fewer read faster
+SAMPLES = 1000  # frames measured; more average out the picture, fewer read faster
+COLOURS = [(0, 0, 255), (0, 200, 0), (255, 0, 0), (0, 200, 255), (255, 0, 255), (255, 255, 0)]  # BGR
 
 
 def _box(text: str, width: int, height: int) -> tuple[int, int, int, int]:
@@ -24,20 +31,72 @@ def _box(text: str, width: int, height: int) -> tuple[int, int, int, int]:
     return x0, y0, x1 - x0, y1 - y0
 
 
-def clean(video: str, box_text: str, out: str | None) -> int:
-    """Measure the see-through overlay inside the box and write a copy of the video without it."""
+def _keep_one(frames: Iterable[media.Frame], kept: list[np.ndarray]) -> Iterator[media.Frame]:
+    """Pass frames through, leaving in kept a copy of one from the second half of the run."""
+    for i, f in enumerate(frames, 1):
+        if i & (i - 1) == 0:  # powers of two: only a few copies, the last one at least halfway through
+            kept[:] = [f.y.copy()]
+        yield f
+
+
+def _picture(luma: np.ndarray, found: list[marks.Mark], path: Path) -> None:
+    """Save the frame in grey with each mark's box drawn and numbered in its own colour."""
+    img = cv2.cvtColor(luma, cv2.COLOR_GRAY2BGR)
+    size = max(1, luma.shape[0] // 360)
+    for i, m in enumerate(found, 1):
+        x, y, w, h = m.box
+        colour = COLOURS[(i - 1) % len(COLOURS)]
+        cv2.rectangle(img, (x, y), (x + w - 1, y + h - 1), colour, size)
+        cv2.putText(img, str(i), (x + 2, y + h - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5 * size, colour, size, cv2.LINE_AA)
+    cv2.imwrite(str(path), img)
+
+
+def _show(path: Path) -> None:
+    """Open the picture in the system viewer; if that fails the user still has its path."""
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)
+        else:
+            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def clean(video: str, box_text: str | None, mark: int | None, out: str | None) -> int:
+    """Find or measure the overlay and write a copy of the video without it."""
     src = Path(video)
     info = media.probe(src)
-    box = _box(box_text, info["width"], info["height"])
     dst = Path(out) if out else src.with_name(f"{src.stem}.clean{src.suffix if src.suffix.lower() in media.MUXERS else '.mkv'}")
     if dst.resolve() == src.resolve():
         raise RuntimeError("--out must differ from the input video")
-    area = marks.region(box, info["width"], info["height"])
-    found = marks.find(media.planes(src, SAMPLES, area), box, area)
+    if box_text is not None:
+        chosen = marks.find(media.planes(src, SAMPLES), _box(box_text, info["width"], info["height"]))[0]
+    else:
+        kept: list[np.ndarray] = []
+        found = marks.find(_keep_one(media.planes(src, SAMPLES), kept))
+        if not found:
+            raise RuntimeError("no fixed overlay was found; if you can see one, give its position with --box x,y,w,h")
+        picture = src.with_name(f"{src.stem}.marks.png")
+        _picture(kept[0], found, picture)
+        for i, m in enumerate(found, 1):
+            x, y, w, h = m.box
+            print(f"{i}: {m.kind} at {x},{y}, size {w}x{h}, opacity {m.opacity:.0%}")
+        if mark is not None:
+            answer = str(mark)
+        elif sys.stdin.isatty():
+            _show(picture)
+            answer = input(f"Which overlay should go (1-{len(found)}, see {picture})? ")
+        else:
+            raise RuntimeError(f"run again with --mark N, where N is the number of the overlay to remove "
+                               f"(the boxes are drawn in {picture})")
+        if not answer.strip().isdigit() or not 1 <= int(answer) <= len(found):
+            raise RuntimeError(f"there is no overlay {answer.strip()}; choose a number from 1 to {len(found)} "
+                               f"(the boxes are drawn in {picture})")
+        chosen = found[int(answer) - 1]
 
     def edit(frame: media.Frame) -> None:
-        for m in found:
-            m.erase(frame)
+        chosen.erase(frame)
 
     n = media.patch(src, dst, edit)
     print(f"wrote {dst} ({n} frames)")
@@ -53,14 +112,16 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="unmark", description="Remove a fixed-position overlay from a video.",
                                 parents=[common])
     sub = p.add_subparsers(dest="cmd", required=True)
-    c = sub.add_parser("clean", help="remove a see-through overlay inside a given box", parents=[common])
+    c = sub.add_parser("clean", help="find a fixed overlay, or take the box you give, and remove it", parents=[common])
     c.add_argument("video")
-    c.add_argument("--box", required=True, help="overlay box in pixels: x,y,w,h")
+    where = c.add_mutually_exclusive_group()
+    where.add_argument("--box", help="overlay box in pixels: x,y,w,h; without it, overlays are found automatically")
+    where.add_argument("--mark", type=int, help="number of the found overlay to remove, as listed")
     c.add_argument("--out", help="output path; default <name>.clean<suffix> next to the input")
     a = p.parse_args(argv)
     try:
-        return clean(a.video, a.box, a.out)
-    except KeyboardInterrupt:
+        return clean(a.video, a.box, a.mark, a.out)
+    except (KeyboardInterrupt, EOFError):  # Ctrl-C, or Ctrl-D at the question
         print("\nstopped; nothing was written")
         return 130
     except Exception as e:  # the last line of defence for non-technical users
