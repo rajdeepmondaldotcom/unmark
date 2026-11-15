@@ -26,8 +26,14 @@ def _edge(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return alpha > 0, alpha[..., None]
 
 
-def _opencv(piece: list[np.ndarray], hole: np.ndarray) -> list[np.ndarray]:
-    return [cv2.inpaint(c, hole.astype(np.uint8), RADIUS, cv2.INPAINT_TELEA) for c in piece]
+def _opencv(crop: np.ndarray, hole: np.ndarray) -> np.ndarray:
+    """cv2.inpaint on a half-size copy, scaled back: about four times faster, and the fill is soft anyway."""
+    h, w = hole.shape
+    half = max(1, w // 2), max(1, h // 2)
+    small = cv2.resize(hole.astype(np.uint8) * 255, half, interpolation=cv2.INTER_AREA) > 0  # any pixel of the hole
+    done = cv2.inpaint(cv2.resize(crop, half, interpolation=cv2.INTER_AREA), small.astype(np.uint8), RADIUS,
+                       cv2.INPAINT_TELEA)
+    return cv2.resize(done, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
 def checkout_python(checkout: Path) -> str:
@@ -49,9 +55,10 @@ def _propainter(piece: list[np.ndarray], hole: np.ndarray, checkout: Path) -> li
     with tempfile.TemporaryDirectory(prefix="unmark-fill-") as tmp:
         tmp = Path(tmp)
         (tmp / "frames").mkdir()
+        # not cv2.imwrite / imread: on Windows they fail, silently, on paths with letters outside the code page
         for i, crop in enumerate(piece):
-            cv2.imwrite(str(tmp / "frames" / f"{i:04d}.png"), cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
-        cv2.imwrite(str(tmp / "mask.png"), hole.astype(np.uint8) * 255)
+            cv2.imencode(".png", cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))[1].tofile(tmp / "frames" / f"{i:04d}.png")
+        cv2.imencode(".png", hole.astype(np.uint8) * 255)[1].tofile(tmp / "mask.png")
         h, w = hole.shape
         # the mask is already grown here, so ProPainter is told not to grow it again
         p = subprocess.run([python, str(script), "--video", str(tmp / "frames"), "--mask", str(tmp / "mask.png"),
@@ -65,7 +72,7 @@ def _propainter(piece: list[np.ndarray], hole: np.ndarray, checkout: Path) -> li
         done = sorted((tmp / "out" / "frames" / "frames").glob("*.png"))
         if len(done) != len(piece):
             raise RuntimeError(f"ProPainter returned {len(done)} frames for {len(piece)}: {p.stdout[-2000:]}")
-        return [cv2.cvtColor(cv2.imread(str(f)), cv2.COLOR_BGR2RGB) for f in done]
+        return [cv2.cvtColor(cv2.imdecode(np.fromfile(f, np.uint8), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB) for f in done]
 
 
 def fill(crops: Iterable[np.ndarray], mask: np.ndarray, cuts: Iterable[int] = ()) -> Iterator[np.ndarray]:
@@ -74,10 +81,16 @@ def fill(crops: Iterable[np.ndarray], mask: np.ndarray, cuts: Iterable[int] = ()
     checkout = os.environ.get("UNMARK_PROPAINTER")
     cuts = set(cuts)
 
+    def blend(crop: np.ndarray, filled: np.ndarray) -> np.ndarray:
+        return np.where(hole[..., None], np.rint(alpha * filled + (1 - alpha) * crop), crop).astype(np.uint8)
+
+    if not checkout:  # each frame on its own, so nothing is held
+        yield from (blend(c, _opencv(c, hole)) for c in crops)
+        return
+
     def run(piece: list[np.ndarray]) -> list[np.ndarray]:
-        done = _propainter(piece, hole, Path(checkout)) if checkout and len(piece) >= SHORTEST else _opencv(piece, hole)
-        return [np.where(hole[..., None], np.rint(alpha * f + (1 - alpha) * c), c).astype(np.uint8)
-                for c, f in zip(piece, done)]
+        done = _propainter(piece, hole, Path(checkout)) if len(piece) >= SHORTEST else [_opencv(c, hole) for c in piece]
+        return [blend(c, f) for c, f in zip(piece, done)]
 
     def faded(piece: list[np.ndarray], tail: list[np.ndarray]) -> list[np.ndarray]:
         """piece filled, its first frames faded in from tail, the previous piece's fill of the same frames."""

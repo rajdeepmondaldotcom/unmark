@@ -58,6 +58,20 @@ def test_opencv_fills_a_solid_block(monkeypatch):
     check_fills_block(list(fill.fill(iter(seen), mask)), clean, seen, mask)
 
 
+def test_opencv_fills_frame_by_frame_without_reading_ahead(monkeypatch):
+    monkeypatch.delenv("UNMARK_PROPAINTER", raising=False)
+    read = []
+
+    def crops():
+        for i, c in enumerate(smooth(12)):
+            read.append(i)
+            yield c
+
+    filled = fill.fill(crops(), block())
+    next(filled)
+    assert read == [0]
+
+
 @pytest.fixture
 def fake(monkeypatch, tmp_path) -> Path:
     """Point fill at the stand-in ProPainter checkout; returns the log file it appends one JSON line per run to."""
@@ -80,6 +94,17 @@ def test_propainter_fills_a_solid_block(fake):
     (run,) = runs(fake)
     assert run["frames"] == 12 and Path(run["cwd"]).resolve() == FAKE.resolve()
     assert {"--save_frames", "--fp16"} <= set(run["argv"])
+
+
+def test_propainter_works_from_a_folder_with_letters_outside_ascii(fake, monkeypatch, tmp_path):
+    # guards Windows, where cv2.imwrite and cv2.imread fail on such paths; macOS and Linux pass either way
+    folder = tmp_path / "été 写真"
+    folder.mkdir()
+    monkeypatch.setattr("tempfile.tempdir", str(folder))
+    clean, mask = smooth(4), block()
+    seen = clean.copy()
+    seen[:, mask] = 255
+    check_fills_block(list(fill.fill(iter(seen), mask)), clean, seen, mask)
 
 
 def numbered(n: int, w: int = 32, h: int = 32) -> np.ndarray:

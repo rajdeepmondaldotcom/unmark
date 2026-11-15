@@ -100,7 +100,8 @@ def test_find_on_ffmpeg_test_sources_lists_just_the_two_overlays(tmp_path):
     # each scene has still structure of its own (testsrc2's layout, settled cells of life), none lasts the whole video
     cut = f"trim=duration={seconds},setpts=PTS-STARTPTS,format=yuv420p"
     scenes = [f"testsrc2=s={w}x{h}:r=10,{cut}", f"mandelbrot=s={w // 2}x{h // 2}:r=10,scale={w}:{h},{cut}",
-              f"life=s={w // 4}x{h // 4}:r=10:seed=1:mold=20:life_color=#ffcc66:death_color=#223344,scale={w}:{h},{cut}",
+              (f"life=s={w // 4}x{h // 4}:r=10:seed=1:mold=20:life_color=#ffcc66:death_color=#223344,"
+               f"scale={w}:{h},{cut}"),
               f"perlin=s={w}x{h}:r=10:random_mode=seed:seed=1,eq=contrast=1.4,{cut}"]
     x, y, bw, bh = hud_box
     graph = ";".join(f"{s}[s{i}]" for i, s in enumerate(scenes)) + ";" + "".join(f"[s{i}]" for i in range(4)) + (

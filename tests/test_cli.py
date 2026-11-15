@@ -156,10 +156,10 @@ def test_clean_says_when_the_mark_number_is_not_listed(tmp_path, capsys):
     assert "there is no overlay 2" in capsys.readouterr().out
 
 
-def solid_clips(tmp_path, frames):
-    """The clean clip and the same with an opaque white panel over PANEL."""
+def solid_clips(tmp_path, frames, panel=PANEL):
+    """The clean clip and the same with an opaque white panel over panel."""
     marked = frames.copy()
-    x, y, w, h = PANEL
+    x, y, w, h = panel
     marked[:, y:y + h, x:x + w] = 230
     return encode(frames, tmp_path / "clean.mp4"), encode(marked, tmp_path / "solid.mp4")
 
@@ -210,15 +210,69 @@ def test_a_given_box_on_a_solid_mark_is_filled_and_nothing_else_changes(tmp_path
 
     assert "softer" in capsys.readouterr().out
     check_cleaned(clean, solid, out, PANEL, bar=28)
-    x, y, w, h = PANEL
-    reach = fill.GROW + fill.FEATHER + 2  # the fill's feathered edge, plus the colour pixel it shares
-    far = np.ones((H, W), bool)
-    far[y - reach:y + h + reach, x - reach:x + w + reach] = False
-    o, m = (decode(p, W, H) for p in (out, solid))
-    for plane, size, keep in ((0, W * H, far), (1, W * H // 4, far[::2, ::2]), (2, W * H // 4, far[::2, ::2])):
+    outside_unchanged(out, solid, PANEL, REACH)
+
+
+REACH = fill.GROW + fill.FEATHER + 2  # pixels a solid fill's feathered edge reaches, plus the colour pixel it shares
+
+
+def outside_unchanged(out, marked, box, reach=0):
+    """Every byte of all three planes more than reach pixels outside box (even-aligned) is the same in out as in
+    marked."""
+    x, y, w, h = box
+    keep = np.ones((H, W), bool)
+    keep[max(0, y - reach):y + h + reach, max(0, x - reach):x + w + reach] = False
+    o, m = (decode(p, W, H) for p in (out, marked))
+    for plane, size, k in ((0, W * H, keep), (1, W * H // 4, keep[::2, ::2]), (2, W * H // 4, keep[::2, ::2])):
         start = 0 if plane == 0 else W * H + (plane - 1) * size
-        a, b = (f[:, start:start + size].reshape(len(f), *keep.shape) for f in (o, m))
-        assert (a[:, keep] == b[:, keep]).all(), plane
+        a, b = (f[:, start:start + size].reshape(len(f), *k.shape) for f in (o, m))
+        assert (a[:, k] == b[:, k]).all(), (plane, int((a[:, k] != b[:, k]).sum()))
+
+
+def plate(box):
+    """Opacity of letters on a see-through plate that fills box exactly, so the overlay reaches every side of it."""
+    x, y, w, h = box
+    opacity = text_opacity(W, H, box)
+    opacity[y:y + h, x:x + w] = np.maximum(opacity[y:y + h, x:x + w], 0.25)
+    return opacity
+
+
+def test_cleaning_a_see_through_mark_changes_nothing_outside_its_box(tmp_path, monkeypatch):
+    monkeypatch.setattr(media, "patch", partial(media.patch, crf=0))  # lossless, so untouched means byte-identical
+    real = still(160, W, H, scenes=4)  # smooth, so the fit from the surrounding picture is the one kept
+    clean, marked = encode(real, tmp_path / "clean.mp4"), encode(stamp(real, plate(BOX)), tmp_path / "marked.mp4")
+    out = tmp_path / "out.mp4"
+
+    assert cli.main(["clean", str(marked), "--box", ",".join(map(str, BOX)), "--out", str(out)]) == 0  # tight
+
+    outside_unchanged(out, marked, BOX)
+    check_cleaned(clean, marked, out)
+
+
+def test_a_solid_panel_in_the_corner_of_the_frame_is_filled(tmp_path, monkeypatch):
+    monkeypatch.delenv("UNMARK_PROPAINTER", raising=False)
+    monkeypatch.setattr(media, "patch", partial(media.patch, crf=0))
+    corner = (256, 140, 64, 40)  # touching the right and bottom edges
+    clean, solid = solid_clips(tmp_path, smooth(150, W, H, seed=1), corner)
+    out = tmp_path / "out.mp4"
+
+    assert cli.main(["clean", str(solid), "--box", ",".join(map(str, corner)), "--out", str(out)]) == 0
+
+    check_cleaned(clean, solid, out, corner, bar=28)
+    outside_unchanged(out, solid, corner, REACH)
+
+
+def test_a_see_through_overlay_in_the_corner_of_the_frame_is_removed(tmp_path, monkeypatch):
+    monkeypatch.setattr(media, "patch", partial(media.patch, crf=0))
+    corner = (224, 132, 96, 48)  # its plate reaches the right and bottom edges
+    real = clean_frames(150, W, H, seed=1)
+    clean, marked = encode(real, tmp_path / "clean.mp4"), encode(stamp(real, plate(corner)), tmp_path / "marked.mp4")
+    out = tmp_path / "out.mp4"
+
+    assert cli.main(["clean", str(marked), "--box", ",".join(map(str, corner)), "--out", str(out)]) == 0
+
+    check_cleaned(clean, marked, out, corner)
+    outside_unchanged(out, marked, corner)
 
 
 def test_a_given_box_with_nothing_in_it_is_refused_in_plain_words(tmp_path, capsys):
@@ -231,6 +285,89 @@ def test_a_given_box_with_nothing_in_it_is_refused_in_plain_words(tmp_path, caps
     print(said)
     assert "nothing see-through or solid" in said and said.count("\n") == 1
     assert not out.exists()
+
+
+@pytest.mark.parametrize("how", ["capitals", "hard link"])
+def test_an_out_that_is_the_input_file_is_refused(tmp_path, capsys, how):
+    src = clips(tmp_path)[1].rename(tmp_path / "clip.mp4")  # would be cleaned, so overwritten without the check
+    before = src.read_bytes()
+    out = tmp_path / "CLIP.mp4"
+    if how == "hard link":
+        out = tmp_path / "other.mp4"
+        out.hardlink_to(src)
+    elif not out.exists():
+        pytest.skip("this disk tells capitals apart, so CLIP.mp4 is another file")
+
+    assert cli.main(["clean", str(src), "--box", ",".join(map(str, BOX)), "--out", str(out)]) == 1
+
+    assert "--out must differ from the input video" in capsys.readouterr().out
+    assert src.read_bytes() == before
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows ignores a folder's read-only flag")
+def test_a_picture_that_cannot_be_saved_ends_in_a_plain_error(tmp_path, capsys, monkeypatch):
+    _, marked = clips(tmp_path)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    tmp_path.chmod(0o555)
+    try:
+        assert cli.main(["clean", str(marked)]) == 1
+    finally:
+        tmp_path.chmod(0o755)
+
+    said = capsys.readouterr().out
+    assert not (tmp_path / "marked.marks.png").exists()
+    assert "could not save" in said and "--mark N" not in said, said
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows ignores a folder's read-only flag")
+def test_with_mark_given_a_picture_that_cannot_be_saved_is_only_a_warning(tmp_path, capsys):
+    (tmp_path / "shared").mkdir()
+    _, marked = clips(tmp_path / "shared")
+    out = tmp_path / "out.mp4"
+    (tmp_path / "shared").chmod(0o555)
+    try:
+        assert cli.main(["clean", str(marked), "--mark", "1", "--out", str(out)]) == 0
+    finally:
+        (tmp_path / "shared").chmod(0o755)
+
+    assert "warning: could not save" in capsys.readouterr().out and out.is_file()
+
+
+def test_an_out_ending_that_cannot_be_written_is_refused(tmp_path, capsys):
+    _, marked = clips(tmp_path)
+    out = tmp_path / "clip.webm"
+
+    assert cli.main(["clean", str(marked), "--box", ",".join(map(str, BOX)), "--out", str(out)]) == 1
+
+    said = capsys.readouterr().out
+    assert ".mp4, .mov, .mkv" in said and said.count("\n") == 1 and not out.exists()
+
+
+def test_a_given_box_on_a_picture_that_barely_changes_says_so(tmp_path, capsys):
+    real = still(150, W, H, scenes=1)  # one scene drifting a few levels: nothing moves behind the overlay
+    marked = encode(stamp(real, text_opacity(W, H, BOX)), tmp_path / "still.mp4")
+
+    assert cli.main(["clean", str(marked), "--box", ",".join(map(str, BOX)), "--out", str(tmp_path / "o.mp4")]) == 1
+
+    said = capsys.readouterr().out
+    assert "barely changes" in said and said.count("\n") == 1, said
+
+
+def test_the_picture_sent_to_propainter_is_at_most_640_wide(tmp_path, monkeypatch):
+    log = tmp_path / "runs.jsonl"
+    monkeypatch.setenv("UNMARK_PROPAINTER", str(Path(__file__).parent / "fake_propainter"))
+    monkeypatch.setenv("UNMARK_PROPAINTER_PYTHON", sys.executable)
+    monkeypatch.setenv("FAKE_PROPAINTER_LOG", str(log))
+    w, h, box = 1280, 720, (400, 500, 400, 100)  # half its width of padding each side would be 800 wide
+    frames = smooth(40, w, h, seed=1)
+    x, y, bw, bh = box
+    frames[:, y:y + bh, x:x + bw] = 230
+    solid = encode(frames, tmp_path / "solid.mp4", audio=False)
+
+    assert cli.main(["clean", str(solid), "--box", ",".join(map(str, box)), "--out", str(tmp_path / "o.mp4")]) == 0
+
+    widths = {json.loads(line)["size"][0] for line in log.read_text().splitlines()}
+    assert widths and all(bw + 2 * cli.ROOM <= v <= 640 for v in widths), widths
 
 
 def test_clean_without_a_terminal_asks_for_mark(tmp_path, capsys, monkeypatch):

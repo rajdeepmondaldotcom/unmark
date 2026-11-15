@@ -56,6 +56,25 @@ def _run(args: list[str]) -> subprocess.CompletedProcess:
     return p
 
 
+def version(name: str) -> tuple[str, str]:
+    """Where ffmpeg or ffprobe (name) is run from, and the first line of its version, without the copyright."""
+    path = _bin(name)
+    return path, _run([path, "-hide_banner", "-version"]).stdout.splitlines()[0].split(" Copyright")[0]
+
+
+def listed(kind: str) -> set[str]:
+    """The names ffmpeg lists for kind: "filters" or "encoders"."""
+    out = _run([_bin("ffmpeg"), "-hide_banner", f"-{kind}"]).stdout
+    return {line.split()[1] for line in out.splitlines() if line.startswith(" ") and len(line.split()) > 2}
+
+
+def sample_clip(path) -> None:
+    """Write a 2-second 320x180 clip with sound to path, made by ffmpeg from its own test pattern."""
+    _run([_bin("ffmpeg"), "-hide_banner", "-nostdin", "-y", "-f", "lavfi", "-i", "testsrc2=s=320x180:r=30:d=2",
+          "-f", "lavfi", "-i", "sine=d=2", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+          "-c:a", "aac", str(path)])
+
+
 def probe(src) -> dict:
     """Probe a video: width, height, fps (rational string), pix_fmt, duration_s, and the colour tags it has."""
     src = Path(src)
@@ -129,23 +148,19 @@ def _frames(p: subprocess.Popen, w: int, h: int) -> Iterator[tuple[bytearray, Fr
         yield buf, frame
 
 
-def planes(src, count: int, box: tuple[int, int, int, int] | None = None) -> Iterator[Frame]:
-    """About count frames spread evenly over the video (all if fewer), optionally cropped to box (x, y, w, h).
-    Each yielded Frame is valid only until the next one."""
+def planes(src, count: int) -> Iterator[Frame]:
+    """About count frames spread evenly over the video (all if fewer). Each yielded Frame is valid only until the
+    next one."""
     src = Path(src)
     info = probe(src)
     # shortcut: assumes the video runs to the end of the file, upgrade if sources with long audio tails appear
     span = info["duration_s"] - info["video_start_s"]
     rate = Fraction(count) / Fraction(span if span > 0 else 1).limit_denominator(1000)
     filters = ["setpts=PTS-STARTPTS", f"fps={rate}"] if rate < Fraction(info["fps"]) else []
-    w, h = info["width"], info["height"]
-    if box:
-        x, y, w, h = box
-        filters.append(f"crop={w}:{h}:{x}:{y}")
-    yield from _stream(src, info["pix_fmt"], ",".join(filters) or "null", w, h)
+    yield from _stream(src, info["pix_fmt"], ",".join(filters) or "null", info["width"], info["height"])
 
 
-def _every(info: dict) -> str:
+def _patch_filters(info: dict) -> str:
     """The filters patch decodes with: fps makes variable-rate input constant; starting at 0 stops it padding a late
     start with copies of frame 0."""
     return f"setpts=PTS-STARTPTS,fps={info['fps']}"
@@ -156,13 +171,13 @@ def crops(src, box: tuple[int, int, int, int]) -> Iterator[Frame]:
     src = Path(src)
     info = probe(src)
     x, y, w, h = box
-    yield from _stream(src, info["pix_fmt"], f"{_every(info)},crop={w}:{h}:{x}:{y}", w, h)
+    yield from _stream(src, info["pix_fmt"], f"{_patch_filters(info)},crop={w}:{h}:{x}:{y}", w, h)
 
 
 def cuts(src) -> list[int]:
     """Numbers of the frames where a new scene starts, counted the way patch counts them."""
     src = Path(src)
-    vf = f"{_every(probe(src))},scale={CUT_WIDTH}:-2,scdet=threshold={CUT_SCORE}"
+    vf = f"{_patch_filters(probe(src))},scale={CUT_WIDTH}:-2,scdet=threshold={CUT_SCORE}"
     out = _run([_bin("ffmpeg"), "-hide_banner", "-nostdin", "-loglevel", "error", "-i", str(src), "-map", "0:v:0",
                 "-vf", f"{vf},metadata=mode=print:key=lavfi.scd.time:file=-", "-f", "null", "-"]).stdout
     return [int(line.split()[0][6:]) for line in out.splitlines() if line.startswith("frame:")]
@@ -195,19 +210,20 @@ def patch(src, dst, edit: Callable[[Frame], None], crf: int = 16) -> int:
                 # the pipe carries no timestamps; a fine time base keeps a start between two frame ticks exact
                 "-vf", f"settb=1/90000,setpts=PTS+{info['video_start_s']}/TB", "-enc_time_base:v", "filter",
                 "-c:v", "libx264", "-crf", str(crf), "-pix_fmt", pf,
-                "-c:a", "copy", "-f", MUXERS.get(dst.suffix.lower(), "matroska"), str(part)]
+                "-c:a", "copy", "-f", MUXERS[dst.suffix.lower()], str(part)]
     n = 0
     try:
         with tempfile.TemporaryFile() as dlog, tempfile.TemporaryFile() as elog:
-            dec = _decode(src, pf, _every(info), dlog)
+            dec = _decode(src, pf, _patch_filters(info), dlog)
             enc = _popen(enc_args, elog, stdin=subprocess.PIPE)
             try:
                 for buf, frame in _frames(dec, w, h):
                     edit(frame)
-                    enc.stdin.write(buf)
+                    try:
+                        enc.stdin.write(buf)
+                    except OSError:  # BrokenPipeError, or EINVAL on Windows
+                        break  # the encoder died; its log says why
                     n += 1
-            except OSError:  # BrokenPipeError, or EINVAL on Windows
-                pass  # the encoder died; its log says why
             finally:
                 dec.stdout.close()
                 dec.wait()

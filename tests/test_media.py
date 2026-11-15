@@ -46,6 +46,18 @@ def test_do_nothing_patch_is_exact(tmp_path):
     assert raw(out) == raw(src)
 
 
+def test_an_edit_that_fails_ends_in_its_own_error_and_leaves_no_file(tmp_path):
+    src = make(tmp_path / "src.mp4", noise(20))
+    out = tmp_path / "out.mp4"
+
+    def edit(f: media.Frame) -> None:
+        raise OSError("disk full")
+
+    with pytest.raises(OSError, match="disk full"):
+        media.patch(src, out, edit)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["src.mp4"]
+
+
 def frame_count(path: Path) -> int:
     """Decoded video frames, counted by ffprobe."""
     out = subprocess.run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries",
@@ -205,16 +217,15 @@ def test_rotated_phone_video_is_refused_in_plain_words(tmp_path):
         media.probe(src)
 
 
-def test_planes_samples_the_whole_video_and_crops_the_box(tmp_path):
-    frames = noise(50, seed=4)  # 2 s at 25 fps; random pictures, so a crop identifies its frame and its place
+def test_planes_samples_the_whole_video(tmp_path):
+    frames = noise(50, seed=4)  # 2 s at 25 fps; random pictures, so each identifies its frame
     src = make(tmp_path / "src.mp4", frames)
-    x, y, w, h = 10, 6, 20, 14
     ys = frames[:, :W * H].reshape(-1, H, W)
     us = frames[:, W * H:W * H * 5 // 4].reshape(-1, H // 2, W // 2)
     got = []
-    for f in media.planes(src, 5, (x, y, w, h)):
-        i = next(i for i in range(50) if (ys[i, y:y + h, x:x + w] == f.y).all())
-        assert (us[i, y // 2:(y + h) // 2, x // 2:(x + w) // 2] == f.u).all()
+    for f in media.planes(src, 5):
+        i = next(i for i in range(50) if (ys[i] == f.y).all())
+        assert (us[i] == f.u).all()
         got.append(i)
     assert 4 <= len(got) <= 6, got
     assert got[0] <= 5 and got[-1] >= 40 and got == sorted(got), got

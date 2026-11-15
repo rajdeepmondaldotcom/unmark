@@ -82,6 +82,6 @@ if args.save_frames:
 
 if os.environ.get("FAKE_PROPAINTER_LOG"):
     with open(os.environ["FAKE_PROPAINTER_LOG"], "a") as log:
-        log.write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(), "frames": len(frames),
+        log.write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(), "frames": len(frames), "size": list(out_size),
                               "corners": [f[0, 0].tolist() for f in frames]}) + "\n")
 print(f'\nAll results are saved in {os.path.join(args.output, video_name)}')

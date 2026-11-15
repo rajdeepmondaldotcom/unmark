@@ -55,8 +55,9 @@ little bigger than the overlay.
 uv run unmark clean holiday.mp4 --box 478,22,132,60
 ```
 
-The cleaned video is called `holiday.clean.mp4`, next to the original. To choose another name, add
-`--out other-name.mp4`. The sound is copied over untouched.
+The cleaned video is called `holiday.clean.mp4`, next to the original (`.clean.mkv` for videos that do not end in
+`.mp4`, `.mov` or `.mkv`). To choose another name, add `--out other-name.mp4`; the name must end in `.mp4`, `.mov` or
+`.mkv`, and must not be the input itself. The sound is copied over untouched.
 
 This is what it printed on a generated 90-second 1080p test video (six scenes, a grey box in the lower left and a
 see-through "MyChannelName" in the lower right):
@@ -102,11 +103,13 @@ a guarantee.
    picture is smooth. It keeps whichever cleans a quarter of the frames, set aside for the purpose, best.
 3. It then undoes that in every frame: it subtracts the overlay's colour and brightens the picture back. Compression
    leaves a faint ripple along the overlay's edges, which brightening makes stronger, so the cleaned pixels are smoothed
-   just enough that the outline is no sharper than the picture around it. Pixels away from the overlay are left exactly
-   as they were.
+   just enough that the outline is no sharper than the picture around it. Nothing outside the overlay's box changes:
+   every pixel there is left exactly as it was.
 4. A **solid** overlay hides the picture completely, so there is nothing to undo. The hidden area is filled in from the
    surrounding video instead: with ProPainter (an AI video filler) when it is set up on a computer with an NVIDIA
-   graphics card, otherwise with a simpler fill from OpenCV that looks softer.
+   graphics card, otherwise with a simpler fill from OpenCV that looks softer. The fill fades into the picture
+   around the box, so pixels just outside the box change too: brightness up to 5 pixels from the box, and colour,
+   which is stored once per 2x2 block of pixels, up to 6. Nothing further away changes.
 
 ## Limits
 
@@ -120,8 +123,9 @@ These are honest limits of this version.
   removed. With a see-through overlay, frames that do not have it (an intro, say) are left alone; a solid overlay's box
   is filled in every frame.
 - **The video must change enough.** Everything is measured from the picture changing behind the overlay. A very short
-  video, or one still scene (a slideshow, a static screen), gives too little change, and it will say it found nothing to
-  remove. A few different scenes are enough if the picture around the overlay is smooth.
+  video, or one still scene (a slideshow, a static screen), gives too little change: it then says that the picture
+  around the box barely changes, or that it found nothing to remove. A few different scenes are enough if the
+  picture around the overlay is smooth.
 - **Overlays on screen for less than about 70% of the video** are not found automatically. Give the box with `--box`
   instead.
 - **Very faint overlays** may not be found automatically. Give the box with `--box` instead.
@@ -131,10 +135,13 @@ These are honest limits of this version.
   that the overlay there is left as it is.
 - **Near-solid parts of a see-through overlay** (the overlay hides 85% or more of the picture there) are brightened back
   as far as they can be, not filled. Those spots can look noisy.
-- **Solid overlays with the simple fill look soft.** The fill takes the whole box, not just the overlay's own pixels.
+- **Solid overlays with the simple fill look soft.** The fill takes the whole box, not just the overlay's own pixels,
+  and is worked out on a half-size copy of the area around it, which makes it about four times faster.
 - **Speed.** It is not fast. The whole input video is decoded 4 times (5 when ProPainter fills a solid overlay, to find
   the scene cuts), and the cleaned video is decoded once more at the end to check it. It is re-encoded once with
-  libx264. No timings on long videos have been measured yet.
+  libx264. On one machine, an Apple M4 Mac, a 90-second 1080p video took about 80 to 110 seconds for a see-through
+  overlay and about 100 seconds for a solid one with the simple fill. Longer videos take roughly proportionally
+  longer. This is one machine; a slower computer will take longer.
 - **Scene cuts** for ProPainter are found with a threshold set on test clips, not on real footage.
 - **Untested:** it has never been run on Windows, and never with the real ProPainter. Both are written to work, but
   only the stand-in in `tests/fake_propainter` has been run.
@@ -148,7 +155,8 @@ uvx ruff check .
 
 The tests build small videos with ffmpeg, with a known clean truth, and check the output against it.
 
-- `unmark/cli.py`: the `clean` and `doctor` commands, the numbered picture, and pasting a fill into the frames.
+- `unmark/cli.py`: the command line and the `clean` command: the numbered picture, and pasting a fill into the frames.
+- `unmark/doctor.py`: the `doctor` command's checks, including the `--gpu` ProPainter sample.
 - `unmark/marks.py`: the maths: finding fixed overlays, measuring a see-through one, inverting it, the visibility score.
 - `unmark/media.py`: every ffmpeg and ffprobe call: probing, reading frames, finding scene cuts, writing the output.
 - `unmark/fill.py`: filling a solid overlay, with ProPainter on pieces of each scene, or with OpenCV.

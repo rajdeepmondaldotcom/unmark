@@ -4,24 +4,21 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import subprocess
 import sys
-import tempfile
-import threading
-import time
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from unmark import fill, marks, media
+from unmark import doctor, fill, marks, media
 
 SAMPLES = 1000  # frames measured; more average out the picture, fewer read faster
 CHECKS = 100  # frames sampled from the input and the written output to check how visible the outline is
 VISIBLE = 1.25  # outline visibility above this counts as still visible; clean pictures measure about 1.0
 ROOM = 32  # fewest pixels of real picture kept around a solid mark for the filler to work from
+WIDEST = 640  # pixels; the picture sent to the filler is kept this wide or less where the box allows, for ProPainter
 COLOURS = [(0, 0, 255), (0, 200, 0), (255, 0, 0), (0, 200, 255), (255, 0, 255), (255, 255, 0)]  # BGR
 
 
@@ -41,7 +38,7 @@ def _box(text: str, width: int, height: int) -> tuple[int, int, int, int]:
 def _crop(box: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
     """box padded with real picture for the filler, inside the frame, at an even place, sides multiples of 8."""
     x, y, w, h = box
-    pad = max(ROOM, max(w, h) // 2)
+    pad = max(ROOM, min(max(w, h) // 2, (WIDEST - w) // 2))
 
     def side(a: int, n: int, size: int) -> tuple[int, int]:
         n = min(n + 2 * pad + 7 & ~7, size & ~7)
@@ -52,7 +49,8 @@ def _crop(box: tuple[int, int, int, int], width: int, height: int) -> tuple[int,
 
 
 def _rgb(y: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
-    # shortcut: OpenCV converts with BT.601 limited range whatever the tags say; only the filled pixels see it
+    # shortcut: OpenCV converts with BT.601 limited range whatever the tags say; only the filled pixels see it,
+    # upgrade by converting with the video's own matrix and range if filled colours look off on BT.709 or full range
     return cv2.cvtColor(np.concatenate((y.ravel(), u.ravel(), v.ravel())).reshape(-1, y.shape[1]),
                         cv2.COLOR_YUV2RGB_I420)
 
@@ -64,7 +62,8 @@ def _filler(src: Path, mark: marks.Mark, width: int, height: int) -> Callable[[m
     if bx + bw > x + w or by + bh > y + h:
         raise RuntimeError("the box spans almost the whole width or height of the video, which is too big to fill in")
     mask = np.zeros((h, w), bool)
-    mask[by - y:by - y + bh, bx - x:bx - x + bw] = True  # shortcut: the whole box, a per-pixel mask would keep more
+    # shortcut: the whole box is filled, upgrade to the mark's own pixels if the fill blurs too much of a large box
+    mask[by - y:by - y + bh, bx - x:bx - x + bw] = True
     if os.environ.get("UNMARK_PROPAINTER"):
         cuts = media.cuts(src)
     else:
@@ -104,7 +103,11 @@ def _picture(luma: np.ndarray, found: list[marks.Mark], path: Path) -> None:
         colour = COLOURS[(i - 1) % len(COLOURS)]
         cv2.rectangle(img, (x, y), (x + w - 1, y + h - 1), colour, size)
         cv2.putText(img, str(i), (x + 2, y + h - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5 * size, colour, size, cv2.LINE_AA)
-    cv2.imwrite(str(path), img)
+    try:  # not cv2.imwrite: it returns False instead of raising, and on Windows fails on non-ASCII paths
+        cv2.imencode(".png", img)[1].tofile(path)
+    except OSError as e:
+        raise RuntimeError(f"could not save {path}, the picture of the overlays found ({e.strerror}); run on a copy of "
+                           "the video in a folder you can write to") from None
 
 
 def _show(path: Path) -> None:
@@ -123,8 +126,11 @@ def clean(video: str, box_text: str | None, mark: int | None, out: str | None) -
     """Find or measure the overlay and write a copy of the video without it."""
     src = Path(video)
     info = media.probe(src)
-    dst = Path(out) if out else src.with_name(f"{src.stem}.clean{src.suffix if src.suffix.lower() in media.MUXERS else '.mkv'}")
-    if dst.resolve() == src.resolve():
+    suffix = src.suffix if src.suffix.lower() in media.MUXERS else ".mkv"
+    dst = Path(out) if out else src.with_name(f"{src.stem}.clean{suffix}")
+    if dst.suffix.lower() not in media.MUXERS:
+        raise RuntimeError(f"--out must end in one of {', '.join(media.MUXERS)}, the kinds of video unmark can write")
+    if dst.exists() and dst.samefile(src):  # not resolve(): disks that ignore case see CLIP.mp4 as clip.mp4
         raise RuntimeError("--out must differ from the input video")
     if box_text is not None:
         chosen = marks.find(lambda: media.planes(src, SAMPLES), _box(box_text, info["width"], info["height"]))[0]
@@ -134,7 +140,12 @@ def clean(video: str, box_text: str | None, mark: int | None, out: str | None) -
         if not found:
             raise RuntimeError("no fixed overlay was found; if you can see one, give its position with --box x,y,w,h")
         picture = src.with_name(f"{src.stem}.marks.png")
-        _picture(kept[0], found, picture)
+        try:
+            _picture(kept[0], found, picture)
+        except RuntimeError as e:
+            if mark is None:  # the user needs the picture to choose
+                raise
+            print(f"warning: {e}")
         for i, m in enumerate(found, 1):
             x, y, w, h = m.box
             print(f"{i}: {m.kind} at {x},{y}, size {w}x{h}, opacity {m.opacity:.0%}")
@@ -165,134 +176,6 @@ def clean(video: str, box_text: str | None, mark: int | None, out: str | None) -
     return 0
 
 
-def _tail(e: Exception) -> str:
-    """The last few lines of an error, on one line."""
-    return " | ".join(str(e).strip().splitlines()[-3:])
-
-
-TORCH = """import torch
-if not torch.cuda.is_available():
-    raise SystemExit(f"torch {torch.__version__} sees no NVIDIA card (its CUDA version: {torch.version.cuda})")
-card = torch.cuda.get_device_properties(0)
-print(f"torch {torch.__version__} sees {card.name}, {card.total_memory / 2**30:.1f} GB")"""
-
-
-def _sample(n: int = 60, w: int = 256, h: int = 128) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """n RGB frames of soft colour waves drifting 2 pixels a frame, the same with a solid block, and the block."""
-    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-    clean = np.stack([np.stack([128 + 60 * np.sin((xx + 2 * i) / (30 + 10 * c) + c) * np.cos(yy / (25 + 8 * c))
-                                for c in range(3)], axis=-1) for i in range(n)]).round().astype(np.uint8)
-    mask = np.zeros((h, w), bool)
-    mask[h // 2 - 16:h // 2 + 16, w // 2 - 24:w // 2 + 24] = True
-    seen = clean.copy()
-    seen[:, mask] = 230
-    return clean, seen, mask
-
-
-def _gpu(checkout: Path, python: str, report: Callable[[bool | None, str, str], None]) -> None:
-    """Ask the checkout's torch about the card, then time ProPainter on the sample, watching the card's memory."""
-    p = subprocess.run([python, "-c", TORCH], check=False, cwd=checkout, capture_output=True, text=True,
-                       encoding="utf-8", errors="replace")
-    said = (p.stdout + p.stderr).strip()
-    if "No module named 'torch'" in said:
-        report(False, "graphics card", f"torch is not installed in {python}, so ProPainter cannot run")
-    else:
-        report(p.returncode == 0, "graphics card", said.splitlines()[-1] if said else f"no answer ({p.returncode})")
-
-    smi, peak, stop = shutil.which("nvidia-smi"), [], threading.Event()
-
-    def watch() -> None:
-        while True:  # one reading straight away, so even a short run has one
-            try:
-                q = subprocess.run([smi, "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-                                   check=False, capture_output=True, text=True, timeout=10)
-            except (OSError, subprocess.SubprocessError):
-                return
-            peak.extend(int(v) for v in q.stdout.split() if v.isdigit())
-            if stop.wait(0.2):
-                return
-
-    watcher = threading.Thread(target=watch, daemon=True)
-    if smi:
-        watcher.start()
-    clean, seen, mask = _sample()
-    start = time.perf_counter()
-    try:
-        out = np.stack(list(fill.fill(iter(seen), mask)))
-    except RuntimeError as e:
-        report(False, "ProPainter sample", _tail(e))
-        return
-    finally:
-        stop.set()
-        if smi:
-            watcher.join()
-    took = time.perf_counter() - start
-    mse = np.mean((out[:, mask].astype(np.float64) - clean[:, mask]) ** 2)
-    memory = f", card memory in use peaked at {max(peak)} MiB (all programs)" if peak else ""
-    report(True, "ProPainter sample", f"{len(out)} frames of {mask.shape[1]}x{mask.shape[0]} filled in {took:.1f} s, "
-                                      f"{10 * np.log10(255 ** 2 / max(mse, 1e-10)):.1f} dB inside the block{memory}")
-
-
-def doctor(gpu: bool) -> int:
-    """Check, one line each, that what clean needs works on this computer. Returns the exit code."""
-    failures = 0
-
-    def report(ok: bool | None, label: str, detail: str = "") -> None:
-        nonlocal failures
-        failures += ok is False
-        print(f"[{'ok' if ok else 'FAIL' if ok is False else 'warn'}] {label}{': ' + detail if detail else ''}")
-
-    try:
-        for name in ("ffmpeg", "ffprobe"):
-            path = media._bin(name)
-            version = media._run([path, "-hide_banner", "-version"]).stdout.splitlines()[0].split(" Copyright")[0]
-            report(True, name, f"{path} ({version})")
-        ff = media._bin("ffmpeg")
-        filters = {line.split()[1] for line in media._run([ff, "-hide_banner", "-filters"]).stdout.splitlines()
-                   if line.startswith(" ") and len(line.split()) > 2}
-        missing = [f for f in media.FILTERS if f not in filters]
-        report(not missing, "filters", "missing " + ", ".join(missing) if missing else ", ".join(media.FILTERS))
-        encoders = {line.split()[1] for line in media._run([ff, "-hide_banner", "-encoders"]).stdout.splitlines()
-                    if line.startswith(" ") and len(line.split()) > 2}
-        report("libx264" in encoders, "encoder", "libx264" if "libx264" in encoders else "libx264 is missing")
-        with tempfile.TemporaryDirectory(prefix="unmark-doctor-") as tmp:
-            sample, out = Path(tmp) / "sample.mp4", Path(tmp) / "out.mp4"
-            media._run([ff, "-hide_banner", "-nostdin", "-y", "-f", "lavfi", "-i", "testsrc2=s=320x180:r=30:d=2",
-                        "-f", "lavfi", "-i", "sine=d=2", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt",
-                        "yuv420p", "-c:a", "aac", str(sample)])
-            start = time.perf_counter()
-            try:
-                # every decode and encode clean uses: sampled, cropped, scene cuts, and the full patch
-                list(media.planes(sample, 10))
-                list(media.crops(sample, (16, 16, 64, 32)))
-                media.cuts(sample)
-                n = media.patch(sample, out, lambda frame: None)
-                report(True, "end-to-end run", f"a {n}-frame test clip went through every ffmpeg command unmark uses "
-                                               f"in {time.perf_counter() - start:.1f} s")
-            except RuntimeError as e:
-                report(False, "end-to-end run", _tail(e))
-    except RuntimeError as e:
-        report(False, "ffmpeg", _tail(e))
-
-    checkout = os.environ.get("UNMARK_PROPAINTER")
-    if not checkout:
-        report(None, "ProPainter", "UNMARK_PROPAINTER is not set, so solid marks will use the softer simple fill")
-        if gpu:
-            report(False, "graphics card", "--gpu needs ProPainter; set UNMARK_PROPAINTER to its folder (on Windows: "
-                                           "setx UNMARK_PROPAINTER C:\\ProPainter, then open a new window)")
-    else:
-        try:
-            python = fill.checkout_python(Path(checkout))
-            report(True, "ProPainter", f"{checkout}, run by {python}")
-        except RuntimeError as e:
-            report(False, "ProPainter", str(e))
-        else:
-            if gpu:
-                _gpu(Path(checkout), python, report)
-    print("doctor: " + ("all required checks passed" if not failures else f"{failures} check(s) failed"))
-    return 1 if failures else 0
-
-
 def main(argv: list[str] | None = None) -> int:
     """Entry point for `unmark`. Mistakes end in one plain sentence and exit code 1; --debug shows the traceback."""
     common = argparse.ArgumentParser(add_help=False)
@@ -313,7 +196,7 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--gpu", action="store_true", help="also fill a short sample with ProPainter on the graphics card")
     a = p.parse_args(argv)
     try:
-        return doctor(a.gpu) if a.cmd == "doctor" else clean(a.video, a.box, a.mark, a.out)
+        return doctor.doctor(a.gpu) if a.cmd == "doctor" else clean(a.video, a.box, a.mark, a.out)
     except (KeyboardInterrupt, EOFError):  # Ctrl-C, or Ctrl-D at the question
         print("\nstopped; nothing was written")
         return 130
