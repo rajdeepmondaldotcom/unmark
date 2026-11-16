@@ -92,6 +92,25 @@ As a guide: an outline 1 brightness level from the picture reads about 1.07 on a
 nothing there to remove and it stops. Either way, watch the cleaned video before you use it. The number is a check, not
 a guarantee.
 
+## Picture quality
+
+The cleaned video is re-encoded: every frame is compressed again, so outside the box it is very close to the original
+but not bit-for-bit the same. Only the tests, which use a lossless setting, get exact copies.
+
+On an Apple-silicon Mac it uses the Mac's hardware HEVC (H.265) encoder. On other computers, or if that encoder does not
+start, it uses libx264 (H.264) at crf 16. `unmark doctor` says which one this computer uses.
+
+This is what each costs, measured on one real video (5 hours 33 minutes, 3840x2160, 60 fps), on two 12-second pieces of
+it, against the decoded original. Higher dB means closer to the original; VMAF 100 means it looks the same.
+
+| encoder | luma PSNR (dark / bright piece) | VMAF | size of the whole video | speed on a busy Apple M4 |
+|---|---|---|---|---|
+| Mac hardware HEVC (used on a Mac) | 50.3 / 47.8 dB | 99.8 / 99.9 | 136 to 184 GB | 27 to 32 frames a second |
+| libx264 crf 16 (used elsewhere) | 48.2 / 45.8 dB | not measured | 172 to 195 GB | about 3 to 4 frames a second |
+| lossless libx264 | exact | 100 | 1,500 to 2,100 GB | too slow to use |
+
+So a lossless copy of that video would need 1.5 to 2 TB, which is why it is not the default.
+
 ## How it works
 
 1. It reads up to 1,000 frames spread over the whole video. Anything that changes from frame to frame is the video;
@@ -139,11 +158,12 @@ These are honest limits of this version.
   and is worked out on a half-size copy of the area around it, which makes it about four times faster.
 - **Speed.** It is not fast. It reads the frames it measures 4 times: on a long video it jumps straight to each one,
   on a short one it decodes the whole video each time, which is quicker there. A solid overlay's fill decodes the
-  whole video once more (twice with ProPainter, which also looks for scene cuts). The video is re-encoded once with
-  libx264, which takes most of the time, and frames of the cleaned video are read at the end to check it. It prints
-  how far it has got after each part it writes, with a rough time left. On one machine, an Apple M4 Mac, a 90-second
-  1080p video took about 80 to 110 seconds for a see-through overlay and about 100 seconds for a solid one with the
-  simple fill. This is one machine; a slower computer will take longer.
+  whole video once more (twice with ProPainter, which also looks for scene cuts). The video is re-encoded once (see
+  "Picture quality"), and frames of the cleaned video are read at the end to check it. It prints how far it has got
+  after each part it writes, with a rough time left. On one machine, an Apple M4 Mac, a 90-second 1080p video took
+  about 80 to 110 seconds for a see-through overlay and about 100 seconds for a solid one with the simple fill, when it
+  still re-encoded with libx264 there; the Mac's hardware encoder is faster. This is one machine; a slower computer
+  will take longer.
 - **Stopping.** With a see-through overlay, the cleaned video is written in parts of 5 minutes of video, which are
   kept if it stops (Ctrl-C, sleep, a lost disk). Run the same command again and it continues from the last finished
   part. A solid overlay, and a video whose frame rate changes, are written in one go and start over. The parts are

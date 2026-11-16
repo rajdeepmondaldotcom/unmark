@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import platform
+import shutil
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -386,7 +390,8 @@ def test_parts_that_have_b_frames_join_with_the_same_timestamps(tmp_path, monkey
     monkeypatch.setattr(media, "CHUNK_S", 0.25)
     src = make(tmp_path / "src.mp4", noise(50, seed=12), fps=30, extra=SOUND, quality=("-crf", "10"))
     one, out = tmp_path / "one.mp4", tmp_path / "out.mp4"
-    assert media.patch(src, one, invert) == media.patch(src, out, invert, resume="k") == 50  # lossy, so B-frames
+    # libx264 at a lossy crf, which makes B-frames; the Mac's hardware HEVC encoder makes none at its defaults
+    assert media.patch(src, one, invert, crf=16) == media.patch(src, out, invert, crf=16, resume="k") == 50
     assert b_frames(out) > 0 and frame_count(out) == 50
     assert video_pts(out) == video_pts(one) and audio_md5(out) == audio_md5(src)
 
@@ -430,6 +435,95 @@ def test_a_video_of_exactly_whole_parts(tmp_path, monkeypatch):
     one, out = tmp_path / "one.mp4", tmp_path / "out.mp4"
     assert media.patch(src, one, invert, crf=0) == media.patch(src, out, invert, crf=0, resume="k") == 36
     assert raw(out) == raw(one) and frame_count(out) == 36
+
+
+def stream(path: Path) -> tuple[str, str]:
+    """The first video stream's codec name and tag, from ffprobe."""
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                          "stream=codec_name,codec_tag_string", "-of", "csv=p=0", str(path)], capture_output=True,
+                         text=True, check=True).stdout
+    return tuple(out.strip().split(","))
+
+
+HEVC = sys.platform == "darwin" and platform.machine() == "arm64" and "hevc_videotoolbox" in subprocess.run(
+    ["ffmpeg", "-hide_banner", "-encoders"], check=False, capture_output=True, text=True).stdout
+needs_hevc = pytest.mark.skipif(not HEVC, reason="needs an Apple-silicon Mac whose ffmpeg lists hevc_videotoolbox")
+
+
+@needs_hevc
+def test_default_on_this_mac_is_hevc_with_its_tags_frames_and_audio(tmp_path):
+    tags = {"color_range": "tv", "color_space": "bt709", "color_primaries": "bt709", "color_transfer": "bt709"}
+    src = make(tmp_path / "src.mp4", drift(50, 7, 120), extra=(
+        *SOUND, "-vf", "setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709"))
+    assert tags.items() <= video_tags(src).items()
+    for name in ("out.mp4", "out.mov", "out.mkv"):
+        out = tmp_path / name
+        assert media.patch(src, out, invert) == 50
+        assert stream(out)[0] == "hevc" and (stream(out)[1] == "hvc1") == (name != "out.mkv"), name
+        assert frame_count(out) == 50 and audio_md5(out) == audio_md5(src), name
+        assert tags.items() <= video_tags(out).items(), name
+        y = lumas(out).astype(float)
+        assert np.abs(y[:, 8:, 8:] - lumas(src)[:, 8:, 8:]).mean() < 1, name  # close to the source outside the edit
+
+
+@needs_hevc
+def test_a_resumed_default_run_matches_an_uninterrupted_one(tmp_path, monkeypatch):
+    monkeypatch.setattr(media, "CHUNK_S", 0.2)  # 5 frames per part at 25 fps
+    src = late(tmp_path / "src.mkv", drift(50, 7, 120))
+    one = tmp_path / "one.mp4"
+    assert media.patch(src, one, invert) == 50
+    calls, remembered = 0, []
+
+    def edit(f: media.Frame) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == fail_at:
+            raise OSError("disk unplugged")
+        invert(f)
+
+    def progress(*_) -> None:
+        remembered.append(json.loads((tmp_path / "out.mp4.parts" / "run.json").read_text("utf-8"))["encoder"])
+
+    out, fail_at = tmp_path / "out.mp4", 13
+    with pytest.raises(OSError, match="unplugged"):
+        media.patch(src, out, edit, resume="k")
+    calls, fail_at = 0, 0
+    assert media.patch(src, out, edit, resume="k", progress=progress) == 50
+    assert calls == 40 and set(remembered) == {"hevc_videotoolbox"}
+    assert stream(out) == stream(one) == ("hevc", "hvc1")
+    assert frame_count(out) == 50 and video_pts(out) == video_pts(one) and audio_md5(out) == audio_md5(src)
+    assert start(out, "v") - start(out, "a") == start(one, "v") - start(one, "a")
+    assert abs(start(out, "v") - start(out, "a") - (start(src, "v") - start(src, "a"))) <= 0.5 / 25
+
+
+def test_an_explicit_crf_gives_h264_and_crf_0_stays_exact(tmp_path):
+    src = make(tmp_path / "src.mp4", noise(20, seed=13), extra=SOUND)
+    for crf in (0, 16):
+        out = tmp_path / f"out-{crf}.mp4"
+        assert media.patch(src, out, lambda f: None, crf=crf) == 20
+        assert stream(out)[0] == "h264", crf
+    assert raw(tmp_path / "out-0.mp4") == raw(src)
+
+
+@needs_hevc
+@pytest.mark.skipif(sys.platform == "win32", reason="the stand-in ffmpeg is a shell script")
+def test_a_hardware_encoder_that_will_not_start_falls_back_to_libx264(tmp_path, monkeypatch):
+    fake = tmp_path / "ffmpeg"
+    fake.write_text(f'#!/bin/sh\ncase "$*" in *hevc_videotoolbox*) echo "no encoder here" >&2; exit 1;; esac\n'
+                    f'exec "{shutil.which("ffmpeg")}" "$@"\n')
+    fake.chmod(0o755)
+    monkeypatch.setenv("UNMARK_FFMPEG", str(fake))
+    monkeypatch.setattr(media, "CHUNK_S", 0.2)
+    why = "hevc_videotoolbox is listed but did not start: ffmpeg failed (1): no encoder here"
+    assert media.encoder() == ("libx264", why)
+    src = make(tmp_path / "src.mp4", noise(20, seed=14), extra=SOUND)
+    out, remembered = tmp_path / "out.mp4", []
+
+    def progress(*_) -> None:
+        remembered.append(json.loads((tmp_path / "out.mp4.parts" / "run.json").read_text("utf-8"))["encoder"])
+
+    assert media.patch(src, out, invert, resume="k", progress=progress) == 20
+    assert stream(out)[0] == "h264" and frame_count(out) == 20 and set(remembered) == {"libx264"}
 
 
 def test_a_variable_rate_video_is_written_in_one_part(tmp_path, monkeypatch):

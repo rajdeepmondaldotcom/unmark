@@ -5,8 +5,10 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import platform
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections import deque
 from collections.abc import Callable, Iterator
@@ -32,6 +34,11 @@ CHUNK_S = 300  # seconds of video in each part of a resumable patch; a stopped r
 STEADY = 500  # packets checked to tell a steady frame rate from a variable one
 SEEK = 500  # frames per sample above which each sample is read with its own seek instead of decoding everything
 SEEKERS = 4  # seeks run at once; each ffmpeg is multi-threaded already, and each holds one decoded frame
+# Apple silicon's HEVC encoder at -q:v 80 measured closer to the source than libx264 crf 16, smaller and faster
+# shortcut: hevc_nvenc on Windows with an NVIDIA card probably helps the same way but has never been run, upgrade by
+# measuring it there the way videotoolbox was measured
+HARDWARE = "hevc_videotoolbox"
+KEY_S = 2  # seconds between keyframes
 
 
 @dataclass
@@ -73,6 +80,19 @@ def listed(kind: str) -> set[str]:
     """The names ffmpeg lists for kind: "filters" or "encoders"."""
     out = _run([_bin("ffmpeg"), "-hide_banner", f"-{kind}"]).stdout
     return {line.split()[1] for line in out.splitlines() if line.startswith(" ") and len(line.split()) > 2}
+
+
+def encoder() -> tuple[str, str]:
+    """The encoder patch uses when no crf is given, and why: this Mac's hardware HEVC encoder if a tiny test encode
+    works, else libx264 (with no reason when there is no hardware encoder to try)."""
+    if sys.platform != "darwin" or platform.machine() != "arm64" or HARDWARE not in listed("encoders"):
+        return "libx264", ""
+    try:
+        _run([_bin("ffmpeg"), "-hide_banner", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i",
+              "testsrc2=s=64x48:d=0.1", "-c:v", HARDWARE, "-f", "null", "-"])
+    except RuntimeError as e:
+        return "libx264", f"{HARDWARE} is listed but did not start: {str(e).strip().splitlines()[-1]}"
+    return HARDWARE, "this Mac's hardware encoder"
 
 
 def sample_clip(path) -> None:
@@ -234,9 +254,10 @@ def _steady(src: Path, fps: Fraction) -> bool:
     return len(t) > 1 and all(abs(b - a - 1 / fps) < 0.25 / fps for a, b in itertools.pairwise(t))
 
 
-def patch(src, dst, edit: Callable[[Frame], None], crf: int = 16, resume: str | None = None,
+def patch(src, dst, edit: Callable[[Frame], None], crf: int | None = None, resume: str | None = None,
           progress: Callable[[int, int], None] | None = None) -> int:
     """Stream every frame of src through edit (in place) into dst, copying the audio untouched. Returns frames in dst.
+    Without crf it uses the best encoder this computer has (see encoder); a crf number means libx264 at that crf, and
     crf=0 is lossless. With resume, a key naming the edit, a constant-rate video is written in parts of CHUNK_S seconds
     that a stopped run keeps, so a later run with the same key continues from them; edit then sees each part from its
     own seek. progress(frames done, about how many in all) is called before the first part and after each one."""
@@ -247,9 +268,13 @@ def patch(src, dst, edit: Callable[[Frame], None], crf: int = 16, resume: str | 
     work, part = dst.with_name(dst.name + ".parts"), dst.with_name(dst.name + ".part")
     run = {"key": resume, "size": src.stat().st_size, "mtime": src.stat().st_mtime_ns, "crf": crf, "frames": per}
     try:
-        kept = per and json.loads((work / "run.json").read_text("utf-8")) == run
-    except (OSError, ValueError):
-        kept = False
+        old = json.loads((work / "run.json").read_text("utf-8"))
+        same = per and {k: v for k, v in old.items() if k != "encoder"} == run
+    except (OSError, ValueError, AttributeError):
+        same = False
+    # an earlier run that fell back to libx264 keeps it, so its parts are not thrown away if the hardware is back
+    run["encoder"] = "libx264" if crf is not None or same and old.get("encoder") == "libx264" else encoder()[0]
+    kept = same and old.get("encoder") == run["encoder"]
     if not kept:  # never mix parts from different runs
         if work.exists():
             shutil.rmtree(work)
@@ -261,7 +286,7 @@ def patch(src, dst, edit: Callable[[Frame], None], crf: int = 16, resume: str | 
         if progress:
             progress(sum(done), about)
         while not done or (per and done[-1] == per):
-            n = _encode(src, work / f"{len(done):06d}", edit, info, crf, per, len(done) * per)
+            n = _encode(src, work / f"{len(done):06d}", edit, info, run, per, len(done) * per)
             if not n:
                 break
             done.append(n)
@@ -271,7 +296,10 @@ def patch(src, dst, edit: Callable[[Frame], None], crf: int = 16, resume: str | 
                                                 for k, n in enumerate(done)), "utf-8")
         _run([_bin("ffmpeg"), "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
               "-itsoffset", f"{info['video_start_s']:.6f}", "-f", "concat", "-i", str(work / "parts.txt"),
-              "-i", str(src), "-map", "0:v", "-map", "1:a?", "-c", "copy", "-f", MUXERS[dst.suffix.lower()], str(part)])
+              "-i", str(src), "-map", "0:v", "-map", "1:a?", "-c", "copy",
+              # hvc1, not ffmpeg's default hev1: Apple's players open only hvc1 HEVC in .mp4 and .mov
+              *(["-tag:v", "hvc1"] if run["encoder"] == HARDWARE and dst.suffix.lower() != ".mkv" else []),
+              "-f", MUXERS[dst.suffix.lower()], str(part)])
         part.replace(dst)
     except BaseException:
         if not per:  # nothing a later run could pick up
@@ -283,9 +311,10 @@ def patch(src, dst, edit: Callable[[Frame], None], crf: int = 16, resume: str | 
     return sum(done)
 
 
-def _encode(src: Path, name: Path, edit: Callable[[Frame], None], info: dict, crf: int, frames: int, first: int) -> int:
-    """Encode, video only, up to frames frames (all without frames) from frame number first into name-<count>.nut;
-    returns the count, and writes no file for none."""
+def _encode(src: Path, name: Path, edit: Callable[[Frame], None], info: dict, run: dict, frames: int,
+            first: int) -> int:
+    """Encode, video only, with run's encoder and crf, up to frames frames (all without frames) from frame number first
+    into name-<count>.nut; returns the count, and writes no file for none."""
     w, h, pf = info["width"], info["height"], info["pix_fmt"]
     tmp = name.with_suffix(".tmp")
     # half a frame early: containers round times (Matroska to 1 ms), and a frame rounded down must not be skipped
@@ -295,7 +324,10 @@ def _encode(src: Path, name: Path, edit: Callable[[Frame], None], info: dict, cr
                 *(a for k, o in COLOURS.items() if k in info for a in (o, info[k])), "-i", "-",
                 # a fine time base, so the late-start shift when the parts are joined is not rounded to a whole frame
                 "-vf", "settb=1/90000", "-enc_time_base:v", "filter",
-                "-c:v", "libx264", "-crf", str(crf), "-pix_fmt", pf, "-f", "nut", str(tmp)]
+                "-c:v", run["encoder"],
+                *(["-q:v", "80"] if run["encoder"] == HARDWARE
+                  else ["-crf", str(16 if run["crf"] is None else run["crf"])]),
+                "-g", str(round(KEY_S * Fraction(info["fps"]))), "-pix_fmt", pf, "-f", "nut", str(tmp)]
     n = 0
     try:
         with tempfile.TemporaryFile() as dlog, tempfile.TemporaryFile() as elog:

@@ -100,7 +100,9 @@ def doctor(gpu: bool) -> int:
         missing = [f for f in media.FILTERS if f not in filters]
         report(not missing, "filters", "missing " + ", ".join(missing) if missing else ", ".join(media.FILTERS))
         encoders = media.listed("encoders")
-        report("libx264" in encoders, "encoder", "libx264" if "libx264" in encoders else "libx264 is missing")
+        name, why = media.encoder()  # libx264 is required either way: explicit crf and the fallback both use it
+        report("libx264" in encoders, "encoder",
+               (f"{name} ({why})" if why else name) if "libx264" in encoders else "libx264 is missing")
         with tempfile.TemporaryDirectory(prefix="unmark-doctor-") as tmp:
             sample, out = Path(tmp) / "sample.mp4", Path(tmp) / "out.mp4"
             media.sample_clip(sample)
