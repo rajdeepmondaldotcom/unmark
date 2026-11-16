@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -26,10 +27,11 @@ def raw(path: Path, pix_fmt: str = "yuv420p") -> bytes:
 
 
 def make(path: Path, frames: np.ndarray, fps: int = 25, pix_fmt: str = "yuv420p", extra: tuple = (),
-         codec: str = "libx264") -> Path:
-    """Encode raw yuv frames (n, SIZE) losslessly, followed by any extra ffmpeg arguments (inputs, maps, tags)."""
+         codec: str = "libx264", quality: tuple = ("-qp", "0")) -> Path:
+    """Encode raw yuv frames (n, SIZE) losslessly (unless quality says otherwise), followed by any extra ffmpeg
+    arguments (inputs, maps, tags)."""
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", pix_fmt,
-                    "-s", f"{W}x{H}", "-r", str(fps), "-i", "-", *extra, "-c:v", codec, "-qp", "0",
+                    "-s", f"{W}x{H}", "-r", str(fps), "-i", "-", *extra, "-c:v", codec, *quality,
                     "-pix_fmt", pix_fmt, str(path)], input=frames.tobytes(), check=True, capture_output=True)
     return path
 
@@ -278,3 +280,164 @@ def test_cuts_finds_a_hard_cut_in_patch_numbering(tmp_path):
         got = media.cuts(src)
         assert len(got) == len(want) == (name == "cut.mkv") and all(abs(g - c) <= 1 for g, c in zip(got, want)), \
             (name, got, want)
+
+
+def counted(n: int) -> np.ndarray:
+    """n yuv frames whose luma shows each frame's number in binary, one 8x8 block per bit, so lossy coding keeps it."""
+    frames = np.full((n, SIZE), 128, np.uint8)
+    bits = (np.arange(n)[:, None] >> np.arange(12)) & 1  # 12 bits: up to 4096 frames
+    blocks = np.where(bits, 200, 40).astype(np.uint8).reshape(n, 2, 6)
+    luma = np.kron(blocks, np.ones((1, 8, 8), np.uint8))  # (n, 16, 48)
+    frames[:, :W * H] = np.pad(luma, ((0, 0), (0, H - 16), (0, W - 48)), constant_values=128).reshape(n, -1)
+    return frames
+
+
+def number(y: np.ndarray) -> int:
+    """The frame number a counted() luma shows."""
+    return int(sum(1 << b for b in range(12) if y[b // 6 * 8 + 4, b % 6 * 8 + 4] > 120))
+
+
+def test_planes_far_apart_seeks_each_sample_and_matches_a_full_decode(tmp_path):
+    n = 2400  # 40 s at 60 fps: 4 samples are 600 frames apart, past the seek rule; 5 are 480 apart, under it
+    src = make(tmp_path / "src.mp4", counted(n), fps=60, extra=("-g", "120", "-preset", "ultrafast"))
+    full = np.frombuffer(raw(src), np.uint8).reshape(-1, SIZE)
+    assert len(full) == n and [number(f[:W * H].reshape(H, W)) for f in full[::599]] == list(range(0, n, 599))
+    got = []
+    for f in media.planes(src, 4):
+        got.append(number(f.y))
+        assert (np.concatenate((f.y.ravel(), f.u.ravel(), f.v.ravel())) == full[got[-1]]).all(), got
+    assert got == [300, 900, 1500, 2100]  # the first frame at or after the middle of each quarter
+
+
+def test_planes_seeks_on_late_video_and_skips_samples_past_its_end(tmp_path):
+    video, src = make(tmp_path / "v.mkv", counted(2400), fps=60, extra=("-g", "120")), tmp_path / "late [4K] x.mkv"
+    ff("-itsoffset", "1", "-i", str(video), "-f", "lavfi", "-i", "sine=duration=61", "-map", "0:v", "-map", "1:a",
+       "-c:v", "copy", "-c:a", "aac", str(src))  # video from 1 s to 41 s, sound to 61 s
+    full = np.frombuffer(raw(src), np.uint8).reshape(-1, SIZE)
+    got = []
+    for f in media.planes(src, 4):  # asks for 7.5, 22.5, 37.5 and 52.5 s into the video
+        got.append(number(f.y))
+        assert (np.concatenate((f.y.ravel(), f.u.ravel(), f.v.ravel())) == full[got[-1]]).all(), got
+    # the file's duration includes the sound's last packet, a few ms past 61 s, so a sample may land one frame later
+    assert len(got) == 3 and all(0 <= g - want <= 1 for g, want in zip(got, (450, 1350, 2250))), got
+
+
+SOUND = ("-f", "lavfi", "-i", "sine=duration=2", "-map", "0:v", "-map", "1:a", "-c:a", "aac")
+
+
+def late(path: Path, frames: np.ndarray) -> Path:
+    """A clip whose video starts 0.5 s after its sound."""
+    video = make(path.with_name("v-" + path.name), frames)
+    ff("-itsoffset", "0.5", "-i", str(video), *SOUND[:4], *SOUND[4:8], "-c:v", "copy", "-c:a", "aac", str(path))
+    return path
+
+
+def b_frames(path: Path) -> int:
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=has_b_frames",
+                          "-of", "csv=p=0", str(path)], capture_output=True, text=True, check=True).stdout
+    return int(out)
+
+
+CLIPS = {  # name: how to make it from frames
+    "30.mp4": lambda p, f: make(p, f, fps=30, extra=SOUND),
+    "ntsc.mp4": lambda p, f: make(p, f, fps="30000/1001", extra=SOUND),
+    "60.mkv": lambda p, f: make(p, f, fps=60, extra=SOUND),  # Matroska rounds every time to 1 ms
+    "bframes.mp4": lambda p, f: make(p, f, fps=30, extra=SOUND, quality=("-crf", "10")),  # lossless has none
+    "late.mkv": late,
+}
+
+
+def numbering() -> tuple[Callable, list[int]]:
+    """An edit that paints each frame's number into its corner, and the list of numbers it has painted."""
+    seen: list[int] = []
+
+    def edit(f: media.Frame) -> None:
+        f.y[:8, :8] = len(seen)
+        seen.append(len(seen))
+
+    return edit, seen
+
+
+@pytest.mark.parametrize("name", CLIPS)
+def test_parts_give_the_same_video_as_one_part(tmp_path, monkeypatch, name):
+    monkeypatch.setattr(media, "CHUNK_S", 0.25)  # 6 to 15 frames per part
+    src = CLIPS[name](tmp_path / f"src-{name}", noise(50, seed=8))
+    if name == "bframes.mp4":
+        assert b_frames(src) > 0  # sanity
+    one = tmp_path / f"one-{name}"
+    edit, seen = numbering()
+    n = media.patch(src, one, edit, crf=0)
+    folder = tmp_path / "out [4K 60FPS PS5 PRO] it's"
+    folder.mkdir()
+    out = folder / f"clean [4K 60FPS] {name}"
+    edit, seen = numbering()
+    progress = []
+    assert media.patch(src, out, edit, crf=0, resume="key", progress=lambda *a: progress.append(a)) == n
+    assert n == len(seen) == frame_count(src) == frame_count(out) == 50
+    assert progress[0][0] == 0 and len(progress) >= 5 and progress[-1][0] == n  # really in parts
+    assert raw(out) == raw(one)
+    assert audio_md5(out) == audio_md5(src)
+    assert video_pts(out) == video_pts(one)
+    assert start(out, "v") - start(out, "a") == start(one, "v") - start(one, "a")
+    assert [p.name for p in folder.iterdir()] == [out.name]
+
+
+def test_parts_that_have_b_frames_join_with_the_same_timestamps(tmp_path, monkeypatch):
+    monkeypatch.setattr(media, "CHUNK_S", 0.25)
+    src = make(tmp_path / "src.mp4", noise(50, seed=12), fps=30, extra=SOUND, quality=("-crf", "10"))
+    one, out = tmp_path / "one.mp4", tmp_path / "out.mp4"
+    assert media.patch(src, one, invert) == media.patch(src, out, invert, resume="k") == 50  # lossy, so B-frames
+    assert b_frames(out) > 0 and frame_count(out) == 50
+    assert video_pts(out) == video_pts(one) and audio_md5(out) == audio_md5(src)
+
+
+def invert(f: media.Frame) -> None:
+    f.y[:8, :8] = 255 - f.y[:8, :8]
+
+
+def test_an_unfinished_run_continues_from_its_finished_parts(tmp_path, monkeypatch):
+    monkeypatch.setattr(media, "CHUNK_S", 0.2)  # 6 frames per part
+    src = make(tmp_path / "src.mp4", noise(40, seed=9), fps=30, extra=SOUND)
+    want = tmp_path / "want.mp4"
+    media.patch(src, want, invert, crf=0)
+    calls = 0
+
+    def edit(f: media.Frame) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == fail_at:
+            raise OSError("disk unplugged")
+        invert(f)
+
+    out, progress = tmp_path / "out.mp4", []
+    for key, again, encoded in (("a", "a", 40 - 12), ("a", "b", 40)):  # the same key keeps the two finished parts
+        calls, fail_at = 0, 15
+        out.unlink(missing_ok=True)
+        with pytest.raises(OSError, match="unplugged"):
+            media.patch(src, out, edit, crf=0, resume=key)
+        assert not out.exists()
+        calls, fail_at = 0, 0
+        progress.clear()
+        assert media.patch(src, out, edit, crf=0, resume=again, progress=lambda *a: progress.append(a)) == 40
+        assert calls == encoded and progress[0][0] == 40 - encoded, key + again
+        assert raw(out) == raw(want) and audio_md5(out) == audio_md5(src)
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["out.mp4", "src.mp4", "want.mp4"]
+
+
+def test_a_video_of_exactly_whole_parts(tmp_path, monkeypatch):
+    monkeypatch.setattr(media, "CHUNK_S", 0.2)  # 6 frames per part, 6 parts
+    src = make(tmp_path / "src.mp4", noise(36, seed=10), fps=30, extra=SOUND)
+    one, out = tmp_path / "one.mp4", tmp_path / "out.mp4"
+    assert media.patch(src, one, invert, crf=0) == media.patch(src, out, invert, crf=0, resume="k") == 36
+    assert raw(out) == raw(one) and frame_count(out) == 36
+
+
+def test_a_variable_rate_video_is_written_in_one_part(tmp_path, monkeypatch):
+    monkeypatch.setattr(media, "CHUNK_S", 0.2)
+    keep = "+".join(f"eq(mod(n\\,24)\\,{k})" for k in (0, 4, 12))
+    src = make(tmp_path / "src.mkv", noise(100, seed=11), fps=100, extra=(*SOUND, "-vf", f"select='{keep}'",
+                                                                          "-fps_mode", "vfr"))
+    one, out, progress = tmp_path / "one.mkv", tmp_path / "out.mkv", []
+    n = media.patch(src, one, invert, crf=0)
+    assert media.patch(src, out, invert, crf=0, resume="k", progress=lambda *a: progress.append(a)) == n
+    assert raw(out) == raw(one) and video_pts(out) == video_pts(one) and len(progress) == 2

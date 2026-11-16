@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 
@@ -122,6 +124,22 @@ def _show(path: Path) -> None:
         pass
 
 
+def _progress() -> Callable[[int, int], None]:
+    """A progress callback for media.patch that prints one line per part, with the time left at this run's speed."""
+    first: list = []
+
+    def show(done: int, total: int) -> None:
+        if not first:
+            first[:] = done, time.monotonic()
+            if done:
+                print(f"continuing an unfinished earlier run, which had already written {done} frames")
+            return
+        left = max(total - done, 0) * (time.monotonic() - first[1]) / (done - first[0])
+        print(f"{min(done / max(total, 1), 1):.0%} written, about {left / 60:.0f} min left")
+
+    return show
+
+
 def clean(video: str, box_text: str | None, mark: int | None, out: str | None) -> int:
     """Find or measure the overlay and write a copy of the video without it."""
     src = Path(video)
@@ -162,12 +180,17 @@ def clean(video: str, box_text: str | None, mark: int | None, out: str | None) -
                                f"(the boxes are drawn in {picture})")
         chosen = found[int(answer) - 1].refined(media.planes(src, SAMPLES))
 
-    # shortcut: each check decodes the whole file again, upgrade with keyframe seeks if long videos feel slow
     before = chosen.visibility(media.planes(src, CHECKS))
     if before <= VISIBLE:  # an outline that cannot be seen in the input means the measurement found only noise
         raise RuntimeError(marks.NOTHING)
-    edit = _filler(src, chosen, info["width"], info["height"]) if chosen.kind == "solid" else chosen.erase
-    n = media.patch(src, dst, edit)
+    if chosen.kind == "solid":
+        # shortcut: a solid fill is written in one go and cannot continue after a stop, as its filler only runs from
+        # the first frame on; upgrade by starting the filler at each part if long videos with solid overlays come
+        n = media.patch(src, dst, _filler(src, chosen, info["width"], info["height"]), progress=_progress())
+    else:
+        key = hashlib.sha256(repr((chosen.box, chosen.kind, chosen.smooth, [p.where for p in chosen.parts])).encode()
+                             + b"".join(a.tobytes() for p in chosen.parts for a in p[1:])).hexdigest()
+        n = media.patch(src, dst, chosen.erase, resume=key, progress=_progress())
     print(f"wrote {dst} ({n} frames)")
     after = chosen.visibility(media.planes(dst, CHECKS))
     print(f"overlay outline visibility (1.0 = gone): input {before:.2f}, output {after:.2f}")
@@ -198,7 +221,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return doctor.doctor(a.gpu) if a.cmd == "doctor" else clean(a.video, a.box, a.mark, a.out)
     except (KeyboardInterrupt, EOFError):  # Ctrl-C, or Ctrl-D at the question
-        print("\nstopped; nothing was written")
+        print("\nstopped; any finished parts of the cleaned video are kept, so running the same command again "
+              "continues from them")
         return 130
     except Exception as e:  # the last line of defence for non-technical users
         if getattr(a, "debug", False):

@@ -399,3 +399,27 @@ def test_clean_leaves_frames_without_the_overlay_alone(tmp_path, where):
     print(f"frames without the overlay, output vs input: worst {min(untouched):.2f} dB; "
           f"frames with it, output vs clean: worst {min(cleaned):.2f} dB, median {np.median(cleaned):.2f} dB")
     assert min(untouched) > 40 and min(cleaned) >= 35
+
+
+def test_a_stopped_clean_continues_where_it_stopped(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(media, "CHUNK_S", 1)  # 30 frames per part
+    clean, marked = clips(tmp_path)
+    out = tmp_path / "out.mp4"
+    erase, calls, stop_at = marks.Mark.erase, [], 45  # Ctrl-C halfway through the second part
+
+    def stopping(self, frame):
+        calls.append(1)
+        if len(calls) == stop_at:
+            raise KeyboardInterrupt
+        erase(self, frame)
+
+    monkeypatch.setattr(marks.Mark, "erase", stopping)
+    args = ["clean", str(marked), "--box", ",".join(map(str, BOX)), "--out", str(out)]
+    assert cli.main(args) == 130
+    assert not out.exists() and "again" in capsys.readouterr().out
+    calls.clear()
+    stop_at = 0
+    assert cli.main(args) == 0
+    assert len(calls) == 150 - 30  # measured to the same key, so the first part was kept
+    assert "continuing" in capsys.readouterr().out
+    check_cleaned(clean, marked, out)

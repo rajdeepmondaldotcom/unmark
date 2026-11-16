@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import shutil
 import subprocess
 import tempfile
+from collections import deque
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -25,6 +28,10 @@ CUT_WIDTH = 160  # pixels; scene cuts are looked for on a picture this wide, whi
 # shortcut: scdet score (0-100) above which a frame starts a new scene, set on synthetic clips (a soft cut scores 8.9,
 # smooth motion 0.1; ffmpeg's default 10 misses that cut), upgrade by calibrating on real game footage
 CUT_SCORE = 5
+CHUNK_S = 300  # seconds of video in each part of a resumable patch; a stopped run loses at most the part it was on
+STEADY = 500  # packets checked to tell a steady frame rate from a variable one
+SEEK = 500  # frames per sample above which each sample is read with its own seek instead of decoding everything
+SEEKERS = 4  # seeks run at once; each ffmpeg is multi-threaded already, and each holds one decoded frame
 
 
 @dataclass
@@ -130,9 +137,12 @@ def _fail(p: subprocess.Popen, log) -> RuntimeError:
     return RuntimeError(f"ffmpeg failed ({p.returncode}): {log.read().decode('utf-8', 'replace')[-2000:]}")
 
 
-def _decode(src: Path, pix_fmt: str, vf: str, log) -> subprocess.Popen:
-    return _popen([_bin("ffmpeg"), "-hide_banner", "-nostdin", "-loglevel", "error", "-i", str(src), "-map", "0:v:0",
-                   "-vf", vf, "-f", "rawvideo", "-pix_fmt", pix_fmt, "-"], log, stdout=subprocess.PIPE)
+def _decode(src: Path, pix_fmt: str, vf: str, log, ss: float | None = None, frames: int = 0) -> subprocess.Popen:
+    """Decode src from ss seconds after the file's start (all of it without ss), at most frames frames if given."""
+    return _popen([_bin("ffmpeg"), "-hide_banner", "-nostdin", "-loglevel", "error",
+                   *(["-ss", f"{ss:.6f}"] if ss is not None else []), "-i", str(src), "-map", "0:v:0", "-vf", vf,
+                   *(["-frames:v", str(frames)] if frames else []), "-f", "rawvideo", "-pix_fmt", pix_fmt, "-"],
+                  log, stdout=subprocess.PIPE)
 
 
 def _frames(p: subprocess.Popen, w: int, h: int) -> Iterator[tuple[bytearray, Frame]]:
@@ -155,9 +165,28 @@ def planes(src, count: int) -> Iterator[Frame]:
     info = probe(src)
     # shortcut: assumes the video runs to the end of the file, upgrade if sources with long audio tails appear
     span = info["duration_s"] - info["video_start_s"]
+    if span * Fraction(info["fps"]) > SEEK * count:
+        yield from _seeks(src, info, [info["video_start_s"] + (k + 0.5) * span / count for k in range(count)])
+        return
     rate = Fraction(count) / Fraction(span if span > 0 else 1).limit_denominator(1000)
     filters = ["setpts=PTS-STARTPTS", f"fps={rate}"] if rate < Fraction(info["fps"]) else []
     yield from _stream(src, info["pix_fmt"], ",".join(filters) or "null", info["width"], info["height"])
+
+
+def _seeks(src: Path, info: dict, times: list[float]) -> Iterator[Frame]:
+    """The first frame at or after each time (seconds from the file's start), in order; times past the end give none."""
+    def one(t: float) -> list[Frame]:
+        frames = _stream(src, info["pix_fmt"], "null", info["width"], info["height"], ss=t, frames=1)
+        return [Frame(f.y.copy(), f.u.copy(), f.v.copy()) for f in frames]
+
+    with ThreadPoolExecutor(SEEKERS) as pool:
+        window: deque = deque()  # not pool.map: it would read every sample ahead and keep them all in memory
+        for t in times:
+            window.append(pool.submit(one, t))
+            if len(window) > SEEKERS:
+                yield from window.popleft().result()
+        while window:
+            yield from window.popleft().result()
 
 
 def _patch_filters(info: dict) -> str:
@@ -183,9 +212,9 @@ def cuts(src) -> list[int]:
     return [int(line.split()[0][6:]) for line in out.splitlines() if line.startswith("frame:")]
 
 
-def _stream(src: Path, pix_fmt: str, vf: str, w: int, h: int) -> Iterator[Frame]:
+def _stream(src: Path, pix_fmt: str, vf: str, w: int, h: int, **seek) -> Iterator[Frame]:
     with tempfile.TemporaryFile() as log:
-        p = _decode(src, pix_fmt, vf, log)
+        p = _decode(src, pix_fmt, vf, log, **seek)
         try:
             for _, frame in _frames(p, w, h):
                 yield frame
@@ -196,25 +225,81 @@ def _stream(src: Path, pix_fmt: str, vf: str, w: int, h: int) -> Iterator[Frame]
             raise _fail(p, log)
 
 
-def patch(src, dst, edit: Callable[[Frame], None], crf: int = 16) -> int:
-    """Stream every frame of src through edit (in place) into dst, copying the audio untouched. Returns frames written.
-    crf=0 is lossless."""
+def _steady(src: Path, fps: Fraction) -> bool:
+    """True when the video's first packets come one frame apart; Matroska reports a steady rate even when it is not."""
+    # shortcut: only the first STEADY packets are looked at, upgrade if sources that change rate later on appear
+    out = _run([_bin("ffprobe"), "-v", "error", "-select_streams", "v:0", "-read_intervals", f"%+#{STEADY}",
+                "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(src)]).stdout
+    t = sorted(float(v) for v in out.split() if v != "N/A")
+    return len(t) > 1 and all(abs(b - a - 1 / fps) < 0.25 / fps for a, b in itertools.pairwise(t))
+
+
+def patch(src, dst, edit: Callable[[Frame], None], crf: int = 16, resume: str | None = None,
+          progress: Callable[[int, int], None] | None = None) -> int:
+    """Stream every frame of src through edit (in place) into dst, copying the audio untouched. Returns frames in dst.
+    crf=0 is lossless. With resume, a key naming the edit, a constant-rate video is written in parts of CHUNK_S seconds
+    that a stopped run keeps, so a later run with the same key continues from them; edit then sees each part from its
+    own seek. progress(frames done, about how many in all) is called before the first part and after each one."""
     src, dst = Path(src), Path(dst)
     info = probe(src)
+    fps = Fraction(info["fps"])
+    per = round(CHUNK_S * fps) if resume is not None and _steady(src, fps) else 0  # 0: one part, the whole video
+    work, part = dst.with_name(dst.name + ".parts"), dst.with_name(dst.name + ".part")
+    run = {"key": resume, "size": src.stat().st_size, "mtime": src.stat().st_mtime_ns, "crf": crf, "frames": per}
+    try:
+        kept = per and json.loads((work / "run.json").read_text("utf-8")) == run
+    except (OSError, ValueError):
+        kept = False
+    if not kept:  # never mix parts from different runs
+        if work.exists():
+            shutil.rmtree(work)
+        work.mkdir()
+        (work / "run.json").write_text(json.dumps(run), "utf-8")
+    done = [int(p.stem.split("-")[1]) for p in sorted(work.glob("*-*.nut"))]
+    about = round(info["duration_s"] * fps)
+    try:
+        if progress:
+            progress(sum(done), about)
+        while not done or (per and done[-1] == per):
+            n = _encode(src, work / f"{len(done):06d}", edit, info, crf, per, len(done) * per)
+            if not n:
+                break
+            done.append(n)
+            if progress:
+                progress(sum(done), about)
+        (work / "parts.txt").write_text("".join(f"file {k:06d}-{n}.nut\nduration {float(n / fps):.6f}\n"
+                                                for k, n in enumerate(done)), "utf-8")
+        _run([_bin("ffmpeg"), "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+              "-itsoffset", f"{info['video_start_s']:.6f}", "-f", "concat", "-i", str(work / "parts.txt"),
+              "-i", str(src), "-map", "0:v", "-map", "1:a?", "-c", "copy", "-f", MUXERS[dst.suffix.lower()], str(part)])
+        part.replace(dst)
+    except BaseException:
+        if not per:  # nothing a later run could pick up
+            shutil.rmtree(work, ignore_errors=True)
+        raise
+    finally:
+        part.unlink(missing_ok=True)
+    shutil.rmtree(work, ignore_errors=True)
+    return sum(done)
+
+
+def _encode(src: Path, name: Path, edit: Callable[[Frame], None], info: dict, crf: int, frames: int, first: int) -> int:
+    """Encode, video only, up to frames frames (all without frames) from frame number first into name-<count>.nut;
+    returns the count, and writes no file for none."""
     w, h, pf = info["width"], info["height"], info["pix_fmt"]
-    part = dst.with_name(dst.name + ".part")
+    tmp = name.with_suffix(".tmp")
+    # half a frame early: containers round times (Matroska to 1 ms), and a frame rounded down must not be skipped
+    ss = info["video_start_s"] + (first - 0.5) / Fraction(info["fps"]) if first else None
     enc_args = [_bin("ffmpeg"), "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
                 "-f", "rawvideo", "-pix_fmt", pf, "-s", f"{w}x{h}", "-framerate", info["fps"],
                 *(a for k, o in COLOURS.items() if k in info for a in (o, info[k])), "-i", "-",
-                "-i", str(src), "-map", "0:v", "-map", "1:a?",
-                # the pipe carries no timestamps; a fine time base keeps a start between two frame ticks exact
-                "-vf", f"settb=1/90000,setpts=PTS+{info['video_start_s']}/TB", "-enc_time_base:v", "filter",
-                "-c:v", "libx264", "-crf", str(crf), "-pix_fmt", pf,
-                "-c:a", "copy", "-f", MUXERS[dst.suffix.lower()], str(part)]
+                # a fine time base, so the late-start shift when the parts are joined is not rounded to a whole frame
+                "-vf", "settb=1/90000", "-enc_time_base:v", "filter",
+                "-c:v", "libx264", "-crf", str(crf), "-pix_fmt", pf, "-f", "nut", str(tmp)]
     n = 0
     try:
         with tempfile.TemporaryFile() as dlog, tempfile.TemporaryFile() as elog:
-            dec = _decode(src, pf, _patch_filters(info), dlog)
+            dec = _decode(src, pf, _patch_filters(info), dlog, ss, frames)
             enc = _popen(enc_args, elog, stdin=subprocess.PIPE)
             try:
                 for buf, frame in _frames(dec, w, h):
@@ -236,7 +321,8 @@ def patch(src, dst, edit: Callable[[Frame], None], crf: int = 16) -> int:
                 raise _fail(enc, elog)
             if dec.returncode != 0:
                 raise _fail(dec, dlog)
-        part.replace(dst)
+        if n:
+            tmp.replace(name.with_name(f"{name.name}-{n}.nut"))
     finally:
-        part.unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
     return n

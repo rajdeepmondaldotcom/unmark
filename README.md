@@ -1,7 +1,7 @@
 # unmark
 
 unmark removes a small overlay that sits in the same place for the whole video, like a logo or a name in a corner.
-You give it a video of 2 to 30 minutes, and it writes a cleaned copy next to it. The original file is never changed.
+You give it a video, from a couple of minutes to several hours, and it writes a cleaned copy next to it. The original file is never changed.
 
 Use it only on footage you own or have permission to edit.
 
@@ -137,11 +137,17 @@ These are honest limits of this version.
   as far as they can be, not filled. Those spots can look noisy.
 - **Solid overlays with the simple fill look soft.** The fill takes the whole box, not just the overlay's own pixels,
   and is worked out on a half-size copy of the area around it, which makes it about four times faster.
-- **Speed.** It is not fast. The whole input video is decoded 4 times (5 when ProPainter fills a solid overlay, to find
-  the scene cuts), and the cleaned video is decoded once more at the end to check it. It is re-encoded once with
-  libx264. On one machine, an Apple M4 Mac, a 90-second 1080p video took about 80 to 110 seconds for a see-through
-  overlay and about 100 seconds for a solid one with the simple fill. Longer videos take roughly proportionally
-  longer. This is one machine; a slower computer will take longer.
+- **Speed.** It is not fast. It reads the frames it measures 4 times: on a long video it jumps straight to each one,
+  on a short one it decodes the whole video each time, which is quicker there. A solid overlay's fill decodes the
+  whole video once more (twice with ProPainter, which also looks for scene cuts). The video is re-encoded once with
+  libx264, which takes most of the time, and frames of the cleaned video are read at the end to check it. It prints
+  how far it has got after each part it writes, with a rough time left. On one machine, an Apple M4 Mac, a 90-second
+  1080p video took about 80 to 110 seconds for a see-through overlay and about 100 seconds for a solid one with the
+  simple fill. This is one machine; a slower computer will take longer.
+- **Stopping.** With a see-through overlay, the cleaned video is written in parts of 5 minutes of video, which are
+  kept if it stops (Ctrl-C, sleep, a lost disk). Run the same command again and it continues from the last finished
+  part. A solid overlay, and a video whose frame rate changes, are written in one go and start over. The parts are
+  kept in a folder named after the output with `.parts` added, which is removed when the video is finished.
 - **Scene cuts** for ProPainter are found with a threshold set on test clips, not on real footage.
 - **Untested:** it has never been run on Windows, and never with the real ProPainter. Both are written to work, but
   only the stand-in in `tests/fake_propainter` has been run.
