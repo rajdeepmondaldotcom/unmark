@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -428,6 +429,53 @@ def test_an_unfinished_run_continues_from_its_finished_parts(tmp_path, monkeypat
     assert len(calls) == 40 - 12 and progress[0][0] == 12  # the two finished parts were kept and used
     assert raw(out) == raw(want) and audio_md5(out) == audio_md5(src)
     assert sorted(p.name for p in tmp_path.iterdir()) == ["out.mp4", "src.mp4", "want.mp4"]
+
+
+def test_a_continued_run_on_an_exfat_disk_does_not_count_the_companion_files_as_parts(tmp_path, monkeypatch):
+    monkeypatch.setattr(media, "CHUNK_S", 0.2)  # 6 frames per part
+    src = make(tmp_path / "src.mp4", noise(40, seed=9), fps=30, extra=SOUND)
+    want = tmp_path / "want.mp4"
+    media.patch(src, want, invert, crf=0)
+    out = tmp_path / "out.mp4"
+    edit, _ = stopping(15)
+    with pytest.raises(OSError, match="unplugged"):
+        media.patch(src, out, edit, crf=0, resume="a")
+    parts = sorted(p for p in out.with_name("out.mp4.parts").iterdir() if p.suffix == ".nut")
+    assert len(parts) == 2  # sanity
+    for p in parts:  # what macOS puts beside each file on exFAT and FAT disks
+        p.with_name("._" + p.name).write_bytes(b"\0\5\26\7" + bytes(4092))
+    edit, calls = stopping(0)
+    assert media.patch(src, out, edit, crf=0, resume="a") == 40
+    assert len(calls) == 40 - 12 and raw(out) == raw(want)
+
+
+def test_a_stale_folder_is_replaced_when_a_file_in_it_vanishes_before_it_is_removed(tmp_path, monkeypatch):
+    monkeypatch.setattr(media, "CHUNK_S", 0.2)  # 6 frames per part
+    src, out = make(tmp_path / "src.mp4", noise(40, seed=9), fps=30, extra=SOUND), tmp_path / "out.mp4"
+    edit, _ = stopping(3)  # stopped before its first part, so its folder is replaced without asking
+    with pytest.raises(OSError, match="unplugged"):
+        media.patch(src, out, edit, crf=0, resume="a")
+    work = out.with_name("out.mp4.parts")
+    pair = {"run.json": "._run.json", "._run.json": "run.json"}
+    (work / "._run.json").write_bytes(bytes(4096))
+    unlink, vanished = os.unlink, []
+
+    def disk_unlink(path, *, dir_fd=None):
+        """os.unlink on a disk that also removes the other of a file and its companion, as macOS does on exFAT; both
+        ways round, so the second one rmtree listed is gone whichever order this disk lists them in."""
+        unlink(path, dir_fd=dir_fd)
+        head, name = os.path.split(path)
+        if name in pair:
+            try:
+                unlink(other := os.path.join(head, pair[name]), dir_fd=dir_fd)
+                vanished.append(other)
+            except FileNotFoundError:  # already gone
+                pass
+
+    monkeypatch.setattr(os, "unlink", disk_unlink)
+    edit, calls = stopping(0)
+    assert media.patch(src, out, edit, crf=0, resume="b") == 40 and len(calls) == 40
+    assert vanished  # sanity: a listed file really was gone when rmtree got to it
 
 
 def test_finished_parts_of_a_different_run_are_never_deleted(tmp_path, monkeypatch):
