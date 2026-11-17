@@ -3,7 +3,7 @@ import subprocess
 import cv2
 import numpy as np
 import pytest
-from helpers import clean_frames, encode, footage, psnr, stamp, still, text_opacity
+from helpers import clean_frames, encode, footage, psnr, smooth, stamp, still, text_opacity
 
 from unmark import marks, media
 
@@ -266,6 +266,50 @@ def test_compression_errors_on_a_smooth_colour_picture_leave_no_colour_outline(t
                     np.stack([t[i][y:y + h, x:x + w] for t in truth]))
         print(f"{name} inside box vs truth: cleaned {ours:.2f} dB")
         assert ours > 50  # plain undoing, (seen - offset) / keep, measured 41 dB here
+
+
+def dimmed(real: media.Frame, opacity: np.ndarray, colour_share: float) -> media.Frame:
+    """real with a white overlay blended in YUV, its colour planes dimmed colour_share times as much as brightness, as
+    the real video's overlay is."""
+    half = opacity.reshape(H // 2, 2, W // 2, 2).mean(axis=(1, 3)) * colour_share
+    return media.Frame(*(np.clip(np.rint(a * c + (1 - a) * p.astype(np.float32)), 0, 255).astype(np.uint8)
+                         for a, c, p in zip((opacity, half, half), (235, 128, 128), (real.y, real.u, real.v))))
+
+
+def colour_shift(colour_share: float, scale: float, tmp_path) -> list[float]:
+    """Per colour plane, RMS over frames of how far the cleaned letters' colour sits from the truth's on average (the
+    whole-word shift the eye sees), on smooth colour waves (a wall, the sky) with their colour scaled by scale. The
+    mark is the white overlay as measured when its colour is mixed as strongly as its brightness."""
+    opacity = text_opacity(W, H, TEXT, peak=0.2)
+    half = opacity.reshape(H // 2, 2, W // 2, 2).mean(axis=(1, 3))
+    luma, chroma, _ = marks._area(TEXT, W, H)
+    parts = [marks.Part(where, a[where] > 0.005, (1 - a[where][a[where] > 0.005]).astype(np.float32),
+                        (c * a[where][a[where] > 0.005]).astype(np.float32))
+             for where, a, c in ((luma, opacity, 235), (chroma, half, 128), (chroma, half, 128))]
+    mark = marks.Mark(TEXT, "see-through", 0.2, parts)
+    truth = yuv(smooth(30, W, H, seed=6), tmp_path)
+    for t in truth:
+        for p in (t.u, t.v):
+            p[:] = np.rint(128 + (p.astype(np.float32) - 128) * scale)
+    seen = [dimmed(t, opacity, colour_share) for t in truth]
+    inside = letters(opacity).reshape(H // 2, 2, W // 2, 2).all(axis=(1, 3))
+    for f in seen:
+        mark.erase(f)
+    shifts = [[np.mean(getattr(f, n)[inside].astype(np.float32) - getattr(t, n)[inside]) for n in "uv"]
+              for f, t in zip(seen, truth)]
+    return list(np.sqrt(np.mean(np.square(shifts), axis=0)))
+
+
+def test_colour_mixed_stronger_than_brightness_is_undone(tmp_path):
+    shift = colour_shift(0.35 / 0.2, 2.0, tmp_path)  # brightness keeps 80% of the picture, colour 65%; strong colour
+    print(f"colour shift of the cleaned letters, u and v: {shift[0]:.2f} {shift[1]:.2f}")
+    assert max(shift) < 1.5  # undoing colour as strongly as brightness left 2.76 and 2.12 levels here
+
+
+def test_a_picture_with_little_colour_is_cleaned_as_before(tmp_path):
+    shift = colour_shift(1.0, 0.1, tmp_path)  # colour mixed as strongly as brightness, behind it nearly grey
+    print(f"colour shift of the cleaned letters, u and v: {shift[0]:.2f} {shift[1]:.2f}")
+    assert max(shift) < 0.1  # within rounding, as before
 
 
 def test_compression_errors_on_a_textured_picture_keep_the_texture(tmp_path, measured):

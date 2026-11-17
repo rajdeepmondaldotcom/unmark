@@ -46,6 +46,15 @@ CALM = (0.25, 0.01)  # levels squared added to both roughnesses, coarse and fine
 FILL = ((0.3, 0.8), (0.1, 0.5))
 PRESENT = 0.5  # share of its full strength the overlay must read at in a frame to be there and be undone
 WEAK = 2.0  # luma levels: an overlay adding less than this on average cannot be read, so it is assumed to be there
+# The real video's overlay dims colour more than brightness, by an amount that changes from scene to scene (it was
+# mixed in before the picture's colours were mapped), so each frame's colour strength is read from the frame itself:
+# the overlay's pattern in what is seen against what the measured overlay should add, both between these spreads
+STROKE = (1.0, 5.0)  # luma pixels: finer is noise, coarser is picture the fill from around gets wrong
+# colour levels squared per colour pixel of the overlay: how strong the pattern must read before a frame's own
+# strength outweighs the measured one; weaker frames (little colour behind) read off by up to half, so this is the
+# least that left the measured strength's cleaning no worse on known-right clips of the real video
+SHRINK = 1.15
+STRONGEST = 2.0  # most times the measured colour strength a frame can read, and its inverse the least
 
 MEAN_EDGE = 3.0  # luma levels per half-size pixel: a stretch's averaged picture is smoother, a fixed overlay's edge not
 VAR_EDGE = 0.25  # natural-log units per pixel, the same test on the log of the temporal variance
@@ -95,7 +104,8 @@ class Mark:
             return
         _clean(frame.y, seen, base, plans[0])
         for plane, plan in zip((frame.u, frame.v), plans[1:]):
-            _clean(plane, *_behind(plane, plan), plan)
+            seen, base = _behind(plane, plan)
+            _clean(plane, seen, base, _strength(seen, base, plan))
 
     def _planned(self, frame: Frame) -> list[Plan]:
         """The parts laid out for frame's size, worked out once per size."""
@@ -310,6 +320,19 @@ def _present(seen: np.ndarray, base: np.ndarray, p: Plan) -> bool:
     smooth = _blur(np.dstack([extra, adds]), FINE)
     pairs = ((extra, adds), (extra - smooth[..., 0], adds - smooth[..., 1]))
     return any(float(e[sel] @ a[sel]) >= PRESENT * float(a[sel] @ a[sel]) for e, a in pairs)
+
+
+def _strength(seen: np.ndarray, base: np.ndarray, p: Plan) -> Plan:
+    """p with the overlay as strong as this frame shows it: one factor for the whole overlay, shrunk towards the
+    measured strength by SHRINK."""
+    # shortcut: one factor per frame; on a strongly coloured, textured scene it can read too strong, upgrade to a
+    # factor that varies across the overlay if that leaves a visible trace
+    band = lambda x: _blur(x, STROKE[0] / p.scale) - _blur(x, STROKE[1] / p.scale)
+    shows, adds = band(seen - base)[p.sel], band(p.offset - p.dim * base)[p.sel]
+    prior = SHRINK * adds.size
+    s = (float(shows @ adds) + prior) / (float(adds @ adds) + prior)
+    s = min(max(s, 1 / STRONGEST), STRONGEST, (1 - FLOOR) / max(float(p.dim.max()), 1e-6))
+    return p._replace(offset=p.offset * s, dim=p.dim * s, gain=1 / (1 - p.dim * s))
 
 
 def _kept(coarse: np.ndarray, fine: np.ndarray, p: Plan) -> tuple[np.ndarray | float, np.ndarray | float]:

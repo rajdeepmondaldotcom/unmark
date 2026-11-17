@@ -123,7 +123,9 @@ So a lossless copy of that video would need 1.5 to 2 TB, which is why it is not 
    frame by frame, from the picture just around the overlay, which predicts the picture behind it well when the
    picture is smooth. It keeps whichever cleans a quarter of the frames, set aside for the purpose, best.
 3. It then undoes that in every frame that has the overlay: it subtracts the overlay's colour and brightens the
-   picture back. Compression leaves small errors in and around the letters, which brightening makes stronger. So,
+   picture back. How strongly the overlay dims colour is read again from each frame, because on a real video it
+   dimmed colour more than brightness, by an amount that changed from scene to scene; frames with little colour keep
+   the measured strength. Compression leaves small errors in and around the letters, which brightening makes stronger. So,
    pixel by pixel and frame by frame, where the picture around the letters is smooth the letters are filled from it,
    and where it is detailed the undone picture is kept. The cleaning changes nothing outside the overlay's box, but
    the whole video is still re-encoded (see "Picture quality").
@@ -157,7 +159,8 @@ These are honest limits of this version.
 - **Compressed video** can keep a faint ghost of the overlay, because compression blurs the very detail that is
   measured. On a 1080p download-quality test video the ghost is about one brightness level, which you may just find on
   a large plain area of one colour if you look for it. On strongly coloured pictures (a bright red wall, say) a faint
-  darker ghost of the letters can stay.
+  darker ghost of the letters can stay, and on strongly coloured, fast or textured scenes a faint colour ghost too: the
+  colour strength read from such a frame can be a little off.
 - **Near-solid parts of a see-through overlay** (the overlay hides 85% or more of the picture there) are brightened back
   as far as they can be, not filled. Those spots can look noisy.
 - **Solid overlays with the simple fill look soft.** The fill takes the whole box, not just the overlay's own pixels,
