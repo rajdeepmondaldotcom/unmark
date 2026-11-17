@@ -45,6 +45,8 @@ HARDWARE = "hevc_videotoolbox"
 QUALITY = 80  # HARDWARE's -q:v, 1 to 100
 KEY_S = 2  # seconds between keyframes
 SPARE = 1.05  # the joined video holds the sound too, so this much more than the parts' size must be free to join them
+# finished parts' names; the digit keeps out the "._" companion files macOS adds beside each on exFAT and FAT disks
+PARTS = "[0-9]*-*.nut"
 
 
 @dataclass
@@ -261,6 +263,12 @@ def _steady(src: Path, fps: Fraction) -> bool:
     return len(t) > 1 and all(abs(b - a - 1 / fps) < 0.25 / fps for a, b in itertools.pairwise(t))
 
 
+def _vanished(func, path, exc: BaseException) -> None:
+    """For rmtree: on exFAT and FAT disks macOS removes a file's "._" companion itself, before rmtree gets to it."""
+    if not isinstance(exc, FileNotFoundError):
+        raise exc
+
+
 def patch(src, dst, edit: Callable[[Frame], None], crf: int | None = None, resume: str | None = None,
           progress: Callable[[int, int], None] | None = None) -> int:
     """Stream every frame of src through edit (in place) into dst, copying the audio untouched. Returns frames in dst.
@@ -283,7 +291,7 @@ def patch(src, dst, edit: Callable[[Frame], None], crf: int | None = None, resum
         old, same = {}, False
     # an earlier run that fell back to libx264 keeps it, so its parts are not thrown away if the hardware is back
     run["encoder"] = "libx264" if crf is not None or same and old.get("encoder") == "libx264" else encoder()[0]
-    finished = sorted(work.glob("*-*.nut")) if resume is not None else []
+    finished = sorted(work.glob(PARTS)) if resume is not None else []
     if not (each and same and old.get("encoder") == run["encoder"]):  # never mix parts from different runs
         if finished and same and old.get("encoder") == HARDWARE:
             raise RuntimeError(f"{HARDWARE} did not start this time, and the finished parts in {work} were made with "
@@ -293,7 +301,7 @@ def patch(src, dst, edit: Callable[[Frame], None], crf: int | None = None, resum
                                "video, overlay, setting or version of unmark); they are kept: to continue them, run "
                                "the earlier command again, or delete that folder to start over")
         if work.exists():
-            shutil.rmtree(work)
+            shutil.rmtree(work, onexc=_vanished)
         work.mkdir()
         (work / "run.json").write_text(json.dumps(run), "utf-8")
     done = [int(p.stem.split("-")[1]) for p in finished]  # frames in each finished part
@@ -311,7 +319,7 @@ def patch(src, dst, edit: Callable[[Frame], None], crf: int | None = None, resum
             done.append(n)
             if progress:
                 progress(sum(done), total)
-        need = SPARE * sum(p.stat().st_size for p in work.glob("*-*.nut"))
+        need = SPARE * sum(p.stat().st_size for p in work.glob(PARTS))
         free = shutil.disk_usage(dst.parent).free
         if need > free:  # the join needs the parts and the whole joined video on the disk at once
             raise RuntimeError(f"joining the cleaned video needs about {math.ceil((need - free) / 1e9)} GB more free "
