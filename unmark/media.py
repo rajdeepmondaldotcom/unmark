@@ -38,11 +38,14 @@ STEADY = 500  # packets checked to tell a steady frame rate from a variable one
 SEEK = 200
 SEEKERS = 4  # seeks run at once; each ffmpeg is multi-threaded already, and each holds one decoded frame
 CRF = 16  # libx264's crf when none is given
-# Apple silicon's HEVC encoder at QUALITY measured closer to the source than libx264 at CRF, smaller and faster
+# Apple silicon's HEVC encoder at QUALITY measured about as close to the source as libx264 at CRF, at well under half
+# the size and many times the speed
 # shortcut: hevc_nvenc on Windows with an NVIDIA card probably helps the same way but has never been run, upgrade by
 # measuring it there the way videotoolbox was measured
 HARDWARE = "hevc_videotoolbox"
-QUALITY = 80  # HARDWARE's -q:v, 1 to 100
+# HARDWARE's -q:v, 1 to 100: the lowest whose worst frames stayed within a VMAF point of 80's on real 4K footage, at
+# about two thirds of 80's size; at 68 fast scenes softened measurably
+QUALITY = 74
 KEY_S = 2  # seconds between keyframes
 SPARE = 1.05  # the joined video holds the sound too, so this much more than the parts' size must be free to join them
 # finished parts' names; the digit keeps out the "._" companion files macOS adds beside each on exFAT and FAT disks

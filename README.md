@@ -99,17 +99,27 @@ a guarantee.
 The cleaned video is re-encoded: every frame is compressed again, so outside the box it is very close to the original
 but not bit-for-bit the same. Only the tests, which use a lossless setting, get exact copies.
 
-On an Apple-silicon Mac it uses the Mac's hardware HEVC (H.265) encoder. On other computers, or if that encoder does not
-start, it uses libx264 (H.264) at crf 16. `unmark doctor` says which one this computer uses.
+On an Apple-silicon Mac it uses the Mac's hardware HEVC (H.265) encoder at quality 74. On other computers, or if that
+encoder does not start, it uses libx264 (H.264) at crf 16. `unmark doctor` says which one this computer uses.
 
-This is what each costs, measured on one real video (5 hours 33 minutes, 3840x2160, 60 fps), on two 12-second pieces of
-it, against the decoded original. Higher dB means closer to the original; VMAF 100 means it looks the same.
+This is what each costs, measured on real pieces of one video (5 hours 33 minutes, 3840x2160, 60 fps, 35 GB as
+downloaded), against the decoded original. Higher dB means closer to the original; VMAF 100 means it looks the same.
 
-| encoder | luma PSNR (dark / bright piece) | VMAF | size of the whole video | speed on a busy Apple M4 |
-|---|---|---|---|---|
-| Mac hardware HEVC (used on a Mac) | 50.3 / 47.8 dB | 99.8 / 99.9 | 136 to 184 GB | 27 to 32 frames a second |
-| libx264 crf 16 (used elsewhere) | 48.2 / 45.8 dB | not measured | 172 to 195 GB | about 3 to 4 frames a second |
-| lossless libx264 | exact | 100 | 1,500 to 2,100 GB | too slow to use |
+| setting | luma PSNR | VMAF | size of the whole video |
+|---|---|---|---|
+| Mac hardware HEVC, quality 74 (used on a Mac) | 46.5 / 46.8 dB | 96.0 / 99.8 | about 65 GB |
+| Mac hardware HEVC, quality 80 | 48.2 / 48.4 dB | 96.7 / 99.8 | about 94 GB |
+| Mac hardware HEVC, quality 68 | 45.3 / 45.6 dB | 94.2 / 99.8 | about 47 GB |
+| libx264 crf 16 (used elsewhere) | 48.2 / 45.8 dB | not measured | 172 to 195 GB |
+| lossless libx264 | exact | 100 | 1,500 to 2,100 GB |
+
+The hardware rows are a fast, strongly coloured piece and a detailed one, 5 seconds each; the libx264 row is two other
+12-second pieces. The 94 GB comes from a real run at quality 80 that wrote 53% of the video in 50 GB, and the other
+hardware sizes are scaled from it. Quality 74 is the lowest setting whose worst frames stayed within one VMAF point of
+quality 80's (95.2 on both pieces, against 96.2 and 95.8); at 68 the fast piece's worst frame fell to 92.8. libx265
+and SVT-AV1 at their fast presets were tried too: at the same closeness they were no smaller on the detailed piece and
+took 5 to 60 times the processor time per frame. The hardware encoder wrote 35 to 57 frames a second at this size on
+an idle Apple M4 at quality 80, and far fewer while the graphics chip was busy with other work.
 
 So a lossless copy of that video would need 1.5 to 2 TB, which is why it is not the default.
 

@@ -46,9 +46,10 @@ CALM = (0.25, 0.01)  # levels squared added to both roughnesses, coarse and fine
 FILL = ((0.3, 0.8), (0.1, 0.5))
 PRESENT = 0.5  # share of its full strength the overlay must read at in a frame to be there and be undone
 WEAK = 2.0  # luma levels: an overlay adding less than this on average cannot be read, so it is assumed to be there
-# The real video's overlay dims colour more than brightness, by an amount that changes from scene to scene (it was
-# mixed in before the picture's colours were mapped), so each frame's colour strength is read from the frame itself:
-# the overlay's pattern in what is seen against what the measured overlay should add, both between these spreads
+# The real video's overlay dims colour more than brightness, by an amount that changes from scene to scene (probably
+# it was mixed in before the picture's colours were mapped), so each frame's colour strength is read from the frame
+# itself: the overlay's pattern in what is seen against what the measured overlay should add, both between these
+# spreads
 STROKE = (1.0, 5.0)  # luma pixels: finer is noise, coarser is picture the fill from around gets wrong
 # colour levels squared per colour pixel of the overlay: how strong the pattern must read before a frame's own
 # strength outweighs the measured one; weaker frames (little colour behind) read off by up to half, so this is the
