@@ -192,24 +192,21 @@ def stamped(real: media.Frame, opacity: np.ndarray, colour: media.Frame) -> medi
 
 
 def compressed(real: media.Frame, opacity: np.ndarray, colour: media.Frame, rng: np.random.Generator,
-               noise: float) -> tuple[media.Frame, np.ndarray]:
-    """real with the overlay, its luma with errors like compression leaves, different in each frame: softened by a
-    varying amount, and noise of about noise levels where the overlay's opacity changes. With the truth to compare
-    with: real's luma softened the same way."""
-    sigma = rng.uniform(0.6, 1.4)
-    edge = np.hypot(cv2.Sobel(opacity, cv2.CV_32F, 1, 0), cv2.Sobel(opacity, cv2.CV_32F, 0, 1)) > 0.05
-    errors = cv2.GaussianBlur(rng.normal(0, noise, opacity.shape).astype(np.float32), (0, 0), 0.7) * 2 * edge
-    seen = stamped(real, opacity, colour)
-    soft = [cv2.GaussianBlur(y.astype(np.float32), (0, 0), sigma) for y in (seen.y, real.y)]
-    seen.y[:] = np.clip(np.rint(soft[0] + errors), 0, 255)
-    return seen, np.clip(np.rint(soft[1]), 0, 255).astype(np.uint8)
-
-
-def undone(mark: marks.Mark, frame: media.Frame) -> np.ndarray:
-    """The luma with the overlay plainly reversed: (seen - offset) / keep."""
-    (where, sel, keep, offset), y = mark.parts[0], frame.y.astype(np.float32)
-    y[where][sel] = (y[where][sel] - offset) / keep
-    return np.clip(np.rint(y), 0, 255).astype(np.uint8)
+               noise: float, planes: int = 1) -> tuple[media.Frame, list[np.ndarray]]:
+    """real with the overlay, the first planes of y, u and v with errors like compression leaves, different in each
+    frame: softened by a varying amount, and noise of about noise levels where the overlay's opacity changes. With the
+    truth to compare with: those planes of real softened the same way."""
+    seen, truth = stamped(real, opacity, colour), []
+    half = opacity.reshape(H // 2, 2, W // 2, 2).mean(axis=(1, 3))
+    for s, a, p, t in list(zip((1, 2, 2), (opacity, half, half), (seen.y, seen.u, seen.v), (real.y, real.u, real.v)))[
+            :planes]:
+        sigma = rng.uniform(0.6, 1.4) / s
+        edge = np.hypot(cv2.Sobel(a, cv2.CV_32F, 1, 0), cv2.Sobel(a, cv2.CV_32F, 0, 1)) > 0.05
+        errors = cv2.GaussianBlur(rng.normal(0, noise, a.shape).astype(np.float32), (0, 0), 0.7 / s) * 2 * edge
+        soft = [cv2.GaussianBlur(q.astype(np.float32), (0, 0), sigma) for q in (p, t)]
+        p[:] = np.clip(np.rint(soft[0] + errors), 0, 255)
+        truth.append(np.clip(np.rint(soft[1]), 0, 255).astype(np.uint8))
+    return seen, truth
 
 
 def fine(y: np.ndarray) -> np.ndarray:
@@ -232,10 +229,10 @@ def test_a_frame_crossed_by_strong_edges_under_the_overlay_is_cleaned(tmp_path, 
     truth = yuv(real, tmp_path)
     for t in truth:
         f = stamped(t, opacity, grey)
-        before, plain = (psnr(a[y:y + h, x:x + w], t.y[y:y + h, x:x + w]) for a in (f.y, undone(mark, f)))
+        before = psnr(f.y[y:y + h, x:x + w], t.y[y:y + h, x:x + w])
         mark.erase(f)
         after = psnr(f.y[y:y + h, x:x + w], t.y[y:y + h, x:x + w])
-        print(f"inside box vs truth: marked {before:.2f} dB, cleaned {after:.2f} dB, plainly reversed {plain:.2f} dB")
+        print(f"inside box vs truth: marked {before:.2f} dB, cleaned {after:.2f} dB")
         assert after >= before + 10
 
 
@@ -244,18 +241,31 @@ def test_compression_errors_on_a_smooth_picture_leave_no_outline(tmp_path, measu
     rng = np.random.default_rng(1)
     real = yuv(still(8, W, H, scenes=8, seed=3), tmp_path)
     seen, truth = zip(*(compressed(t, opacity, grey, rng, 3.0) for t in real))
-    plain = [undone(mark, f) for f in seen]
+    truth = [t[0] for t in truth]
     for f in seen:
         mark.erase(f)
     x, y, w, h = TEXT
     box = np.s_[y:y + h, x:x + w]
-    ours, theirs = (psnr(np.stack([a[box] for a in out]), np.stack([t[box] for t in truth]))
-                    for out in ([f.y for f in seen], plain))
-    shown, left = (mark.visibility(media.Frame(a, f.u, f.v) for a, f in zip(out, seen))
-                   for out in ([f.y for f in seen], plain))
-    print(f"inside box vs truth: cleaned {ours:.2f} dB, plainly reversed {theirs:.2f} dB; "
-          f"visibility cleaned {shown:.2f}, plainly reversed {left:.2f}")
-    assert ours > theirs + 3 and shown < 1.1 < left
+    ours = psnr(np.stack([f.y[box] for f in seen]), np.stack([t[box] for t in truth]))
+    shown, clean = (mark.visibility(media.Frame(a, f.u, f.v) for a, f in zip(out, seen))
+                    for out in ([f.y for f in seen], truth))
+    print(f"inside box vs truth: cleaned {ours:.2f} dB; visibility cleaned {shown:.2f}, truth {clean:.2f}")
+    assert ours > 50 and abs(shown - clean) < 0.1
+
+
+def test_compression_errors_on_a_smooth_colour_picture_leave_no_colour_outline(tmp_path, measured):
+    mark, opacity, grey = measured
+    rng = np.random.default_rng(3)
+    seen, truth = zip(*(compressed(t, opacity, grey, rng, 1.0, planes=3) for t in yuv(
+        still(8, W, H, scenes=8, seed=5), tmp_path)))
+    for f in seen:
+        mark.erase(f)
+    x, y, w, h = (v // 2 for v in TEXT)
+    for i, name in ((1, "u"), (2, "v")):
+        ours = psnr(np.stack([getattr(f, name)[y:y + h, x:x + w] for f in seen]),
+                    np.stack([t[i][y:y + h, x:x + w] for t in truth]))
+        print(f"{name} inside box vs truth: cleaned {ours:.2f} dB")
+        assert ours > 50  # plain undoing, (seen - offset) / keep, measured 41 dB here
 
 
 def test_compression_errors_on_a_textured_picture_keep_the_texture(tmp_path, measured):
@@ -265,12 +275,12 @@ def test_compression_errors_on_a_textured_picture_keep_the_texture(tmp_path, mea
     truth = yuv(np.clip(footage(8, W, H, scenes=8, seed=4) + grain, 0, 255).astype(np.uint8), tmp_path)
     inside, kept = letters(opacity), []
     for real in truth:
-        f, t = compressed(real, opacity, grey, rng, 1.0)
-        plain = fine(undone(mark, f))[inside].mean() / fine(t)[inside].mean()
+        f, (t, ) = compressed(real, opacity, grey, rng, 1.0)
         mark.erase(f)
         kept.append(fine(f.y)[inside].mean() / fine(t)[inside].mean())
-        print(f"fine detail inside the letters over truth's: cleaned {kept[-1]:.2f}, plainly reversed {plain:.2f}")
-    # measured 1.00 to 1.13, 1.09 on average: a little of the errors stays, as texture hides it; never matte
+        print(f"fine detail inside the letters over truth's: cleaned {kept[-1]:.2f}")
+    # the requirement: texture within 10% of the truth's, never matte (a little of the errors may stay, as texture
+    # hides it)
     assert min(kept) >= 0.9 and 0.9 <= np.mean(kept) <= 1.1
 
 
@@ -280,6 +290,17 @@ def test_a_frame_without_the_overlay_is_left_exactly_as_it_was(tmp_path, measure
         before = [p.copy() for p in (f.y, f.u, f.v)]
         mark.erase(f)
         assert all((a == b).all() for a, b in zip(before, (f.y, f.u, f.v)))
+
+
+def test_refining_on_frames_where_nothing_can_be_measured_says_so(tmp_path, measured):
+    mark = measured[0]
+    # no overlay, but a picture as bright as it on average, so every frame reads as having it, and busier inside the
+    # box than around it, so nothing there is dimmed
+    frames = np.full((12, H, W, 3), 200.0)
+    x, y, w, h = TEXT
+    frames[:, y:y + h, x:x + w] += np.random.default_rng(4).normal(0, 20, (12, h, w, 1))
+    with pytest.raises(RuntimeError, match="nothing see-through or solid was measured"):
+        mark.refined(yuv(np.clip(frames, 0, 255).astype(np.uint8), tmp_path))
 
 
 def test_finding_reads_the_frames_once_and_a_given_box_twice(tmp_path):

@@ -189,8 +189,9 @@ def clean(video: str, box_text: str | None, mark: int | None, out: str | None) -
         n = media.patch(src, dst, _filler(src, chosen, info["width"], info["height"]), progress=_progress())
     else:
         cv2.setNumThreads(1)  # the area cleaned per frame is small: OpenCV's threads cost more than they save there
-        key = hashlib.sha256(repr((chosen.box, chosen.kind, [p.where for p in chosen.parts])).encode()
-                             + b"".join(a.tobytes() for p in chosen.parts for a in p[1:])).hexdigest()
+        # unmark's own code too, so a run is never continued by a different version of the cleaning
+        code = b"".join(f.read_bytes() for f in sorted(Path(__file__).parent.glob("*.py")))
+        key = hashlib.sha256(chosen.fingerprint() + code).hexdigest()
         n = media.patch(src, dst, chosen.erase, resume=key, progress=_progress())
     print(f"wrote {dst} ({n} frames)")
     after = chosen.visibility(media.planes(dst, CHECKS))
@@ -219,11 +220,14 @@ def main(argv: list[str] | None = None) -> int:
                        parents=[common])
     d.add_argument("--gpu", action="store_true", help="also fill a short sample with ProPainter on the graphics card")
     a = p.parse_args(argv)
+    # each line as it is printed, also into a pipe or log file, where the progress would otherwise wait hours
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
     try:
         return doctor.doctor(a.gpu) if a.cmd == "doctor" else clean(a.video, a.box, a.mark, a.out)
     except (KeyboardInterrupt, EOFError):  # Ctrl-C, or Ctrl-D at the question
-        print("\nstopped; any finished parts of the cleaned video are kept, so running the same command again "
-              "continues from them")
+        print("\nstopped; any finished parts of the cleaned video are kept, and if there are some, running the same "
+              "command again continues from them")
         return 130
     except Exception as e:  # the last line of defence for non-technical users
         if getattr(a, "debug", False):

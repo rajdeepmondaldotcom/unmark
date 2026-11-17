@@ -423,3 +423,29 @@ def test_a_stopped_clean_continues_where_it_stopped(tmp_path, capsys, monkeypatc
     assert len(calls) == 150 - 30  # measured to the same key, so the first part was kept
     assert "continuing" in capsys.readouterr().out
     check_cleaned(clean, marked, out)
+
+
+def test_a_stopped_clean_does_not_continue_with_changed_cleaning_code(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(media, "CHUNK_S", 1)  # 30 frames per part
+    marked = clips(tmp_path)[1]
+    out = tmp_path / "out.mp4"
+    erase, calls = marks.Mark.erase, []
+
+    def stopping(self, frame):
+        calls.append(1)
+        if len(calls) == 45:  # Ctrl-C halfway through the second part
+            raise KeyboardInterrupt
+        erase(self, frame)
+
+    monkeypatch.setattr(marks.Mark, "erase", stopping)
+    args = ["clean", str(marked), "--box", ",".join(map(str, BOX)), "--out", str(out)]
+    assert cli.main(args) == 130
+    tuned = tmp_path / "tuned"  # the package as it would be after a constant in marks.py was tuned
+    tuned.mkdir()
+    for f in Path(cli.__file__).parent.glob("*.py"):
+        (tuned / f.name).write_bytes(f.read_bytes() + (b"\n# tuned\n" if f.name == "marks.py" else b""))
+    monkeypatch.setattr(cli, "__file__", str(tuned / "cli.py"))
+    capsys.readouterr()
+    assert cli.main(args) == 1
+    said = capsys.readouterr().out
+    assert "kept" in said and "delete" in said and not out.exists()

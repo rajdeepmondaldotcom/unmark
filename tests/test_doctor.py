@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -45,6 +48,26 @@ def test_doctor_says_when_the_hardware_encoder_will_not_start(capsys, monkeypatc
     assert "[ok] encoder: libx264" in said and "[ok] end-to-end run:" in said
     if HEVC:
         assert "libx264 (hevc_videotoolbox is listed but did not start: ffmpeg failed (1): no encoder here)" in said
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the stand-in ffprobe is a shell script")
+def test_each_line_reaches_a_pipe_as_it_is_printed(tmp_path):
+    release = tmp_path / "release"
+    probe = tmp_path / "ffprobe"  # holds doctor after its ffmpeg line until the test has read that line
+    probe.write_text(f'#!/bin/sh\nwhile [ ! -e "{release}" ]; do sleep 0.1; done\n'
+                     f'exec "{shutil.which("ffprobe")}" "$@"\n')
+    probe.chmod(0o755)
+    env = {**os.environ, "UNMARK_FFPROBE": str(probe)}
+    p = subprocess.Popen([sys.executable, "-m", "unmark.cli", "doctor"], stdout=subprocess.PIPE, text=True, env=env)
+    later = threading.Timer(10, release.touch)  # a held-back line would otherwise never come
+    later.start()
+    try:
+        line = p.stdout.readline()
+        assert line.startswith("[ok] ffmpeg:") and not release.exists(), line
+    finally:
+        later.cancel()
+        release.touch()
+        p.communicate(timeout=120)
 
 
 def test_doctor_fails_in_plain_words_when_ffmpeg_is_missing(capsys, monkeypatch, tmp_path):
