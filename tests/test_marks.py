@@ -2,7 +2,8 @@ import subprocess
 
 import cv2
 import numpy as np
-from helpers import clean_frames, encode, footage, stamp, still, text_opacity
+import pytest
+from helpers import clean_frames, encode, footage, psnr, stamp, still, text_opacity
 
 from unmark import marks, media
 
@@ -163,6 +164,122 @@ def test_visibility_means_the_same_on_a_smooth_picture(tmp_path):
     unseen, seen = outline(0.02), outline(0.1)  # steps of at most 1 level, which the eye cannot find, and of 5
     print(f"visibility: 1-level outline {unseen:.2f}, 5-level outline {seen:.2f}")
     assert abs(unseen - 1) < 0.15 and seen > 1.5
+
+
+@pytest.fixture(scope="module")
+def measured(tmp_path_factory):
+    """The text overlay measured on lossless footage, and how to stamp it on YUV frames the way that footage had it."""
+    tmp = tmp_path_factory.mktemp("measured")
+    opacity = text_opacity(W, H, TEXT)
+    mark = marks.find(lambda: media.planes(encode(stamp(footage(300, W, H, seed=5), opacity), tmp / "m.mp4",
+                                                  audio=False), 1000), TEXT)[0]
+    grey = next(iter(yuv(np.full((1, H, W, 3), 200, np.uint8), tmp)))  # the overlay's colour, converted as ffmpeg does
+    return mark, opacity, grey
+
+
+def yuv(frames: np.ndarray, tmp) -> list[media.Frame]:
+    """RGB frames as the YUV frames ffmpeg makes of them."""
+    return [media.Frame(f.y.copy(), f.u.copy(), f.v.copy())
+            for f in media.planes(encode(frames, tmp / "yuv.mp4", audio=False), 1000)]
+
+
+def stamped(real: media.Frame, opacity: np.ndarray, colour: media.Frame) -> media.Frame:
+    """real with the overlay blended in each plane, colour at half size."""
+    half = opacity.reshape(H // 2, 2, W // 2, 2).mean(axis=(1, 3))
+    return media.Frame(*(np.clip(np.rint(a * c + (1 - a) * p.astype(np.float32)), 0, 255).astype(np.uint8)
+                         for a, c, p in zip((opacity, half, half), (colour.y, colour.u, colour.v),
+                                            (real.y, real.u, real.v))))
+
+
+def compressed(real: media.Frame, opacity: np.ndarray, colour: media.Frame, rng: np.random.Generator,
+               noise: float) -> tuple[media.Frame, np.ndarray]:
+    """real with the overlay, its luma with errors like compression leaves, different in each frame: softened by a
+    varying amount, and noise of about noise levels where the overlay's opacity changes. With the truth to compare
+    with: real's luma softened the same way."""
+    sigma = rng.uniform(0.6, 1.4)
+    edge = np.hypot(cv2.Sobel(opacity, cv2.CV_32F, 1, 0), cv2.Sobel(opacity, cv2.CV_32F, 0, 1)) > 0.05
+    errors = cv2.GaussianBlur(rng.normal(0, noise, opacity.shape).astype(np.float32), (0, 0), 0.7) * 2 * edge
+    seen = stamped(real, opacity, colour)
+    soft = [cv2.GaussianBlur(y.astype(np.float32), (0, 0), sigma) for y in (seen.y, real.y)]
+    seen.y[:] = np.clip(np.rint(soft[0] + errors), 0, 255)
+    return seen, np.clip(np.rint(soft[1]), 0, 255).astype(np.uint8)
+
+
+def undone(mark: marks.Mark, frame: media.Frame) -> np.ndarray:
+    """The luma with the overlay plainly reversed: (seen - offset) / keep."""
+    (where, sel, keep, offset), y = mark.parts[0], frame.y.astype(np.float32)
+    y[where][sel] = (y[where][sel] - offset) / keep
+    return np.clip(np.rint(y), 0, 255).astype(np.uint8)
+
+
+def fine(y: np.ndarray) -> np.ndarray:
+    y = y.astype(np.float32)
+    return np.abs(y - cv2.GaussianBlur(y, (0, 0), 2))
+
+
+def letters(opacity: np.ndarray) -> np.ndarray:
+    """The overlay's pixels away from its edges."""
+    return cv2.erode((opacity > 0.1).astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+
+
+def test_a_frame_crossed_by_strong_edges_under_the_overlay_is_cleaned(tmp_path, measured):
+    mark, opacity, grey = measured
+    real = footage(6, W, H, seed=8)
+    x, y, w, h = TEXT
+    real[:, y + 8:y + h - 8, x - 10:x + w + 10] = 235  # a bright menu bar with dark text on it across the letters
+    for k in range(x - 8, x + w + 8, 9):
+        real[:, y + 14:y + h - 14, k:k + 3] = 20
+    truth = yuv(real, tmp_path)
+    for t in truth:
+        f = stamped(t, opacity, grey)
+        before, plain = (psnr(a[y:y + h, x:x + w], t.y[y:y + h, x:x + w]) for a in (f.y, undone(mark, f)))
+        mark.erase(f)
+        after = psnr(f.y[y:y + h, x:x + w], t.y[y:y + h, x:x + w])
+        print(f"inside box vs truth: marked {before:.2f} dB, cleaned {after:.2f} dB, plainly reversed {plain:.2f} dB")
+        assert after >= before + 10
+
+
+def test_compression_errors_on_a_smooth_picture_leave_no_outline(tmp_path, measured):
+    mark, opacity, grey = measured
+    rng = np.random.default_rng(1)
+    real = yuv(still(8, W, H, scenes=8, seed=3), tmp_path)
+    seen, truth = zip(*(compressed(t, opacity, grey, rng, 3.0) for t in real))
+    plain = [undone(mark, f) for f in seen]
+    for f in seen:
+        mark.erase(f)
+    x, y, w, h = TEXT
+    box = np.s_[y:y + h, x:x + w]
+    ours, theirs = (psnr(np.stack([a[box] for a in out]), np.stack([t[box] for t in truth]))
+                    for out in ([f.y for f in seen], plain))
+    shown, left = (mark.visibility(media.Frame(a, f.u, f.v) for a, f in zip(out, seen))
+                   for out in ([f.y for f in seen], plain))
+    print(f"inside box vs truth: cleaned {ours:.2f} dB, plainly reversed {theirs:.2f} dB; "
+          f"visibility cleaned {shown:.2f}, plainly reversed {left:.2f}")
+    assert ours > theirs + 3 and shown < 1.1 < left
+
+
+def test_compression_errors_on_a_textured_picture_keep_the_texture(tmp_path, measured):
+    mark, opacity, grey = measured
+    rng = np.random.default_rng(2)
+    grain = rng.normal(0, 15, (8, H, W, 1))  # a grainy, busy picture, as in fast or dark game scenes
+    truth = yuv(np.clip(footage(8, W, H, scenes=8, seed=4) + grain, 0, 255).astype(np.uint8), tmp_path)
+    inside, kept = letters(opacity), []
+    for real in truth:
+        f, t = compressed(real, opacity, grey, rng, 1.0)
+        plain = fine(undone(mark, f))[inside].mean() / fine(t)[inside].mean()
+        mark.erase(f)
+        kept.append(fine(f.y)[inside].mean() / fine(t)[inside].mean())
+        print(f"fine detail inside the letters over truth's: cleaned {kept[-1]:.2f}, plainly reversed {plain:.2f}")
+    # measured 1.00 to 1.13, 1.09 on average: a little of the errors stays, as texture hides it; never matte
+    assert min(kept) >= 0.9 and 0.9 <= np.mean(kept) <= 1.1
+
+
+def test_a_frame_without_the_overlay_is_left_exactly_as_it_was(tmp_path, measured):
+    mark = measured[0]
+    for f in yuv(np.concatenate([footage(4, W, H, seed=9), still(4, W, H, seed=9)]), tmp_path):
+        before = [p.copy() for p in (f.y, f.u, f.v)]
+        mark.erase(f)
+        assert all((a == b).all() for a, b in zip(before, (f.y, f.u, f.v)))
 
 
 def test_finding_reads_the_frames_once_and_a_given_box_twice(tmp_path):
