@@ -161,7 +161,8 @@ The unmark project is private on GitHub. Use **one** of these two ways.
 ### Clean your first video
 
 14. Copy a video into a folder with plenty of free space, for example `C:\videos`. The cleaned copy can be bigger than
-    the original, because it is saved at high quality.
+    the original, because it is saved at high quality, and while it is being finished it needs about twice its own
+    size free.
 
 15. Run unmark on it. Type `uv run unmark clean ` (with a space at the end), then drag the video from File Explorer
     into the PowerShell window, or hold Shift, right-click the file, choose "Copy as path", and paste it. Press Enter.
@@ -170,7 +171,7 @@ The unmark project is private on GitHub. Use **one** of these two ways.
     uv run unmark clean "C:\videos\my-video.mp4"
     ```
 
-    It reads the whole video, which takes a while. Then it opens a picture with numbered boxes around the overlays it
+    It reads frames from all through the video, which takes a while. Then it opens a picture with numbered boxes around the overlays it
     found and asks which one should go. Type the number and press Enter.
     Success: you see `wrote C:\videos\my-video.clean.mp4 (... frames)` and a line
     `overlay outline visibility (1.0 = gone): input ..., output ...`. The README explains how to read it.

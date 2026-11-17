@@ -120,10 +120,11 @@ So a lossless copy of that video would need 1.5 to 2 TB, which is why it is not 
    It measures this two ways: from how much the picture changes behind the overlay compared with around it, and,
    frame by frame, from the picture just around the overlay, which predicts the picture behind it well when the
    picture is smooth. It keeps whichever cleans a quarter of the frames, set aside for the purpose, best.
-3. It then undoes that in every frame: it subtracts the overlay's colour and brightens the picture back. Compression
-   leaves a faint ripple along the overlay's edges, which brightening makes stronger, so the cleaned pixels are smoothed
-   just enough that the outline is no sharper than the picture around it. Nothing outside the overlay's box changes:
-   every pixel there is left exactly as it was.
+3. It then undoes that in every frame that has the overlay: it subtracts the overlay's colour and brightens the
+   picture back. Compression leaves small errors in and around the letters, which brightening makes stronger. So,
+   pixel by pixel and frame by frame, where the picture around the letters is smooth the letters are filled from it,
+   and where it is detailed the undone picture is kept. The cleaning changes nothing outside the overlay's box, but
+   the whole video is still re-encoded (see "Picture quality").
 4. A **solid** overlay hides the picture completely, so there is nothing to undo. The hidden area is filled in from the
    surrounding video instead: with ProPainter (an AI video filler) when it is set up on a computer with an NVIDIA
    graphics card, otherwise with a simpler fill from OpenCV that looks softer. The fill fades into the picture
@@ -140,7 +141,10 @@ These are honest limits of this version.
   an upright copy first.
 - **Fixed overlays only.** An overlay that moves, fades in and out at different places, or changes shape cannot be
   removed. With a see-through overlay, frames that do not have it (an intro, say) are left alone; a solid overlay's box
-  is filled in every frame.
+  is filled in every frame. A frame whose picture is about as bright as the overlay, busy, and crossed by strong
+  edges can be misread as not having it, and is then left as it is.
+- **An overlay with no room of its own height above or below it** (one nearly as tall as the frame) is only undone:
+  its letters are not filled from the picture around them, so faint compression errors there can stay.
 - **The video must change enough.** Everything is measured from the picture changing behind the overlay. A very short
   video, or one still scene (a slideshow, a static screen), gives too little change: it then says that the picture
   around the box barely changes, or that it found nothing to remove. A few different scenes are enough if the
@@ -150,24 +154,34 @@ These are honest limits of this version.
 - **Very faint overlays** may not be found automatically. Give the box with `--box` instead.
 - **Compressed video** can keep a faint ghost of the overlay, because compression blurs the very detail that is
   measured. On a 1080p download-quality test video the ghost is about one brightness level, which you may just find on
-  a large plain area of one colour if you look for it. The first frame after a scene cut can be compressed so roughly
-  that the overlay there is left as it is.
+  a large plain area of one colour if you look for it. On strongly coloured pictures (a bright red wall, say) a faint
+  darker ghost of the letters can stay.
 - **Near-solid parts of a see-through overlay** (the overlay hides 85% or more of the picture there) are brightened back
   as far as they can be, not filled. Those spots can look noisy.
 - **Solid overlays with the simple fill look soft.** The fill takes the whole box, not just the overlay's own pixels,
   and is worked out on a half-size copy of the area around it, which makes it about four times faster.
-- **Speed.** It is not fast. It reads the frames it measures 4 times: on a long video it jumps straight to each one,
-  on a short one it decodes the whole video each time, which is quicker there. A solid overlay's fill decodes the
-  whole video once more (twice with ProPainter, which also looks for scene cuts). The video is re-encoded once (see
-  "Picture quality"), and frames of the cleaned video are read at the end to check it. It prints how far it has got
-  after each part it writes, with a rough time left. On one machine, an Apple M4 Mac, a 90-second 1080p video took
-  about 80 to 110 seconds for a see-through overlay and about 100 seconds for a solid one with the simple fill, when it
-  still re-encoded with libx264 there; the Mac's hardware encoder is faster. This is one machine; a slower computer
-  will take longer.
+- **Speed.** It is not fast. It reads the frames it measures twice, with `--box` or without: on a long video it jumps
+  straight to each one, on a short one it decodes the whole video each time, which is quicker there. It reads 100
+  frames once more to check how visible the overlay is. A solid overlay's fill decodes the whole video once more
+  (twice with ProPainter, which also looks for scene cuts). The video is re-encoded once (see "Picture quality"), and
+  100 frames of the cleaned video are read at the end to check it. It prints how far it has got after each part it
+  writes, with a rough time left. On one machine, an Apple M4 Mac, a 90-second 1080p video took about 80 to 110
+  seconds for a see-through overlay and about 100 seconds for a solid one with the simple fill, when it still
+  re-encoded with libx264 there; the Mac's hardware encoder is faster. This is one machine; a slower computer will
+  take longer.
+  <!-- real-video numbers go here -->
 - **Stopping.** With a see-through overlay, the cleaned video is written in parts of 5 minutes of video, which are
   kept if it stops (Ctrl-C, sleep, a lost disk). Run the same command again and it continues from the last finished
-  part. A solid overlay, and a video whose frame rate changes, are written in one go and start over. The parts are
-  kept in a folder named after the output with `.parts` added, which is removed when the video is finished.
+  part. A solid overlay, and a video whose frame rate changes, are written in one go and cannot continue: they start
+  over. The parts are kept in a folder named after the output with `.parts` added, which is removed when the video
+  is finished.
+- **Unfinished parts are never deleted for you.** If a later run differs from the one that wrote them (another video,
+  overlay, setting or version of unmark), it stops with an error saying the parts are kept: run the earlier command
+  again to finish, or delete the `.parts` folder to start over. If the Mac's hardware encoder wrote them and does not
+  start this time, it says so: try again.
+- **Disk space.** Joining the parts into the finished video needs both on the disk at once, so about twice the size
+  of the cleaned video must be free (see "Picture quality" for sizes). If it is not, it says roughly how many GB to
+  free. Parts that can continue (see "Stopping") are kept, so after freeing that the same command finishes the job.
 - **Scene cuts** for ProPainter are found with a threshold set on test clips, not on real footage.
 - **Untested:** it has never been run on Windows, and never with the real ProPainter. Both are written to work, but
   only the stand-in in `tests/fake_propainter` has been run.
