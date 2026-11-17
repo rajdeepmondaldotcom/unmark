@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import os
+import zipfile
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import NamedTuple
 
 import cv2
@@ -99,6 +103,33 @@ class Mark:
             self._plans[frame.y.shape] = [_plan(p, self.box, plane.shape, i > 0)
                                           for i, (p, plane) in enumerate(zip(self.parts, (frame.y, frame.u, frame.v)))]
         return self._plans[frame.y.shape]
+
+    def save(self, path: Path, notes: dict) -> None:
+        """Write this mark and notes (plain values) to path as .npz, all at once."""
+        arrays = {"box": np.array(self.box), "kind": np.array(self.kind), "opacity": np.array(self.opacity),
+                  "notes": np.array(json.dumps(notes))}
+        for i, p in enumerate(self.parts):
+            arrays |= {f"where{i}": np.array([(s.start, s.stop) for s in p.where]), f"sel{i}": p.sel,
+                       f"keep{i}": p.keep, f"offset{i}": p.offset}
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            with open(tmp, "wb") as f:
+                np.savez(f, **arrays)
+            tmp.replace(path)  # a stop while writing never leaves half a file
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    @staticmethod
+    def load(path: Path) -> tuple[Mark, dict] | None:
+        """The mark and notes save wrote to path; None when there is none or it cannot be read."""
+        try:
+            with np.load(path, allow_pickle=False) as f:  # never pickle: a changed file could run code
+                parts = [Part(tuple(slice(int(a), int(b)) for a, b in f[f"where{i}"]), f[f"sel{i}"], f[f"keep{i}"],
+                              f[f"offset{i}"]) for i in range(sum(k.startswith("sel") for k in f.files))]
+                return (Mark(tuple(int(v) for v in f["box"]), str(f["kind"]), float(f["opacity"]), parts),
+                        json.loads(str(f["notes"])))
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile):
+            return None
 
     def fingerprint(self) -> bytes:
         """Bytes that differ whenever anything erase reads from this mark does."""

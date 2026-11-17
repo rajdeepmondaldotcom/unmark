@@ -425,6 +425,50 @@ def test_a_stopped_clean_continues_where_it_stopped(tmp_path, capsys, monkeypatc
     check_cleaned(clean, marked, out)
 
 
+def reading(monkeypatch) -> list[str]:
+    """The names of the videos media.planes is asked to read from, as it is asked."""
+    names, planes = [], media.planes
+
+    def counted(src, count):
+        names.append(Path(src).name)
+        return planes(src, count)
+
+    monkeypatch.setattr(media, "planes", counted)
+    return names
+
+
+@pytest.mark.parametrize("where", [["--box", ",".join(map(str, BOX))], ["--mark", "1"]])
+def test_a_continued_clean_does_not_measure_the_overlay_again(tmp_path, capsys, monkeypatch, where):
+    monkeypatch.setattr(media, "CHUNK_S", 1)  # 30 frames per part
+    monkeypatch.setattr(media, "patch", partial(media.patch, crf=0))  # lossless, so the same run gives the same bytes
+    _, marked = clips(tmp_path)
+    one, out = tmp_path / "one.mp4", tmp_path / "out.mp4"
+    assert cli.main(["clean", str(marked), *where, "--out", str(one)]) == 0
+    visible = re.search(r"input [\d.]+, output [\d.]+", capsys.readouterr().out)[0]
+    erase, calls = marks.Mark.erase, []
+
+    def stopping(self, frame):
+        calls.append(1)
+        if len(calls) == 45:  # Ctrl-C halfway through the second part
+            raise KeyboardInterrupt
+        erase(self, frame)
+
+    monkeypatch.setattr(marks.Mark, "erase", stopping)
+    assert cli.main(["clean", str(marked), *where, "--out", str(out)]) == 130
+    monkeypatch.setattr(marks.Mark, "erase", erase)
+    capsys.readouterr()
+    read = reading(monkeypatch)
+
+    assert cli.main(["clean", str(marked), *where, "--out", str(out)]) == 0
+
+    said = capsys.readouterr().out
+    assert read == ["out.mp4"], read  # only the check of the written video; nothing of the input was read to measure
+    assert "earlier" in said and "continuing" in said and "see-through at" not in said, said
+    assert decode(out, W, H).tobytes() == decode(one, W, H).tobytes() and visible in said
+    left = {"clean.mp4", "marked.mp4", "one.mp4", "out.mp4"} | ({"marked.marks.png"} if "--mark" in where else set())
+    assert {p.name for p in tmp_path.iterdir()} == left  # nothing of the stopped run is left behind
+
+
 def test_a_stopped_clean_does_not_continue_with_changed_cleaning_code(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr(media, "CHUNK_S", 1)  # 30 frames per part
     marked = clips(tmp_path)[1]
@@ -446,6 +490,8 @@ def test_a_stopped_clean_does_not_continue_with_changed_cleaning_code(tmp_path, 
         (tuned / f.name).write_bytes(f.read_bytes() + (b"\n# tuned\n" if f.name == "marks.py" else b""))
     monkeypatch.setattr(cli, "__file__", str(tuned / "cli.py"))
     capsys.readouterr()
+    read = reading(monkeypatch)
     assert cli.main(args) == 1
     said = capsys.readouterr().out
     assert "kept" in said and "delete" in said and not out.exists()
+    assert "marked.mp4" in read  # the earlier run's measurement was not used by the changed code

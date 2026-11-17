@@ -168,13 +168,16 @@ These are honest limits of this version.
   writes, with a rough time left. On one machine, an Apple M4 Mac, a 90-second 1080p video took about 80 to 110
   seconds for a see-through overlay and about 100 seconds for a solid one with the simple fill, when it still
   re-encoded with libx264 there; the Mac's hardware encoder is faster. This is one machine; a slower computer will
-  take longer.
+  take longer. A run that continues after a stop (see "Stopping") skips the measuring and the first check, and starts
+  writing straight away.
   <!-- real-video numbers go here -->
 - **Stopping.** With a see-through overlay, the cleaned video is written in parts of 5 minutes of video, which are
-  kept if it stops (Ctrl-C, sleep, a lost disk). Run the same command again and it continues from the last finished
-  part. A solid overlay, and a video whose frame rate changes, are written in one go and cannot continue: they start
-  over. The parts are kept in a folder named after the output with `.parts` added, which is removed when the video
-  is finished.
+  kept if it stops (Ctrl-C, sleep, a lost disk). Run the same command again, with the same `--box` or `--mark`, and it
+  continues from the last finished part. It does not measure the overlay again: it uses the measurement it saved
+  before writing, in a file named after the output with `.mark.npz` added, and says so. A solid overlay, and a video
+  whose frame rate changes, are written in one go and cannot continue: they start over. The parts are kept in a folder
+  named after the output with `.parts` added. The folder and the saved measurement are removed when the video is
+  finished.
 - **Unfinished parts are never deleted for you.** If a later run differs from the one that wrote them (another video,
   overlay, setting or version of unmark), it stops with an error saying the parts are kept: run the earlier command
   again to finish, or delete the `.parts` folder to start over. If the Mac's hardware encoder wrote them and does not

@@ -150,7 +150,21 @@ def clean(video: str, box_text: str | None, mark: int | None, out: str | None) -
         raise RuntimeError(f"--out must end in one of {', '.join(media.MUXERS)}, the kinds of video unmark can write")
     if dst.exists() and dst.samefile(src):  # not resolve(): disks that ignore case see CLIP.mp4 as clip.mp4
         raise RuntimeError("--out must differ from the input video")
-    if box_text is not None:
+    # unmark's own code too, so a run is never continued by a different version of the cleaning
+    code = b"".join(f.read_bytes() for f in sorted(Path(__file__).parent.glob("*.py")))
+    stat = src.stat()
+
+    def request(number: int | None) -> str:  # names this source, box or overlay number, and code
+        return hashlib.sha256(repr((stat.st_size, stat.st_mtime_ns, box_text, number)).encode() + code).hexdigest()
+
+    # next to the parts patch keeps, so a stopped run continues without measuring again
+    saved = dst.with_name(dst.name + ".mark.npz")
+    loaded = marks.Mark.load(saved) if box_text is not None or mark is not None else None
+    before = None
+    if loaded and loaded[1].get("request") == request(mark):
+        chosen, before = loaded[0], loaded[1]["before"]
+        print("using the overlay as measured by the earlier unfinished run")
+    elif box_text is not None:
         chosen = marks.find(lambda: media.planes(src, SAMPLES), _box(box_text, info["width"], info["height"]))[0]
     else:
         kept: list[np.ndarray] = []
@@ -178,21 +192,23 @@ def clean(video: str, box_text: str | None, mark: int | None, out: str | None) -
         if not answer.strip().isdigit() or not 1 <= int(answer) <= len(found):
             raise RuntimeError(f"there is no overlay {answer.strip()}; choose a number from 1 to {len(found)} "
                                f"(the boxes are drawn in {picture})")
-        chosen = found[int(answer) - 1].refined(media.planes(src, SAMPLES))
-
-    before = chosen.visibility(media.planes(src, CHECKS))
-    if before <= VISIBLE:  # an outline that cannot be seen in the input means the measurement found only noise
-        raise RuntimeError(marks.NOTHING)
+        mark = int(answer)
+        chosen = found[mark - 1].refined(media.planes(src, SAMPLES))
+    if before is None:
+        before = chosen.visibility(media.planes(src, CHECKS))
+        if before <= VISIBLE:  # an outline that cannot be seen in the input means the measurement found only noise
+            raise RuntimeError(marks.NOTHING)
+        if chosen.kind != "solid":
+            chosen.save(saved, {"request": request(mark), "before": before})
     if chosen.kind == "solid":
         # shortcut: a solid fill is written in one go and cannot continue after a stop, as its filler only runs from
         # the first frame on; upgrade by starting the filler at each part if long videos with solid overlays come
         n = media.patch(src, dst, _filler(src, chosen, info["width"], info["height"]), progress=_progress())
     else:
         cv2.setNumThreads(1)  # the area cleaned per frame is small: OpenCV's threads cost more than they save there
-        # unmark's own code too, so a run is never continued by a different version of the cleaning
-        code = b"".join(f.read_bytes() for f in sorted(Path(__file__).parent.glob("*.py")))
         key = hashlib.sha256(chosen.fingerprint() + code).hexdigest()
         n = media.patch(src, dst, chosen.erase, resume=key, progress=_progress())
+    saved.unlink(missing_ok=True)
     print(f"wrote {dst} ({n} frames)")
     after = chosen.visibility(media.planes(dst, CHECKS))
     print(f"overlay outline visibility (1.0 = gone): input {before:.2f}, output {after:.2f}")
