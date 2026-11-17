@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
 import cv2
@@ -19,11 +19,30 @@ APART = 32.0  # luma levels: the flat colour's opacity is solved from the means 
 FLOOR = 0.15
 PEAK = 10  # percentile of an overlay's keep taken as its peak; the very lowest few are noise or passing scenery
 HOLD = 4  # every this-many-th sampled frame is kept out of measuring, to choose the measurement that cleans it best
-# luma levels (the smoothing's range): compression leaves ringing at the overlay's edges and inverting makes it larger;
-# the least smoothing that leaves the outline no sharper than the picture around it is kept, on frames held out
-SMOOTH = (0.0, 2.0, 4.0, 8.0, 16.0)
-REACH = 7  # pixels across the window that smoothing averages over
 FAINT = 1.0  # luma levels per pixel: an outline gradient this weak cannot be seen, so visibility counts it as none
+# Compression leaves errors of a few levels at and inside the overlay's letters, different in every frame, which undoing
+# it keeps. The part shaped like the overlay's edges softened is fitted and taken out; the rest is judged by comparing
+# the undone letters with the same letter shape moved onto nearby picture without the overlay (the yardstick): coarse
+# and fine detail are each kept where the letters are no rougher than the yardstick and filled from around where rougher
+RIM = 2  # luma pixels around the overlay that compression errors spill into, cleaned too and never predicted from
+SPREAD = 6.0  # luma pixels: the spread of the average of the surrounding picture carried across the letters
+WIDE = 15.0  # luma pixels: a wider average, for inside closed letters (an "e", an "A") where SPREAD finds nothing
+WIDE_SHARE = 0.03  # its weight against SPREAD's, so it only counts where SPREAD has nothing to average
+SOFT = 1.5  # luma pixels: the blur compression softens the overlay's edges by; how much it does is fitted locally
+SOFTEST = 2.0  # most of that softening fitted, so real edges crossing the letters cannot drive it far
+SURE = 12.0  # luma levels: compression errors stay within this; larger differences are real picture and are kept
+NEAR = 12.0  # luma pixels: the spread over which the softening is fitted and roughness compared
+FINE = 2.5  # luma pixels: detail finer than this is judged apart from the coarser
+# levels squared: the letters' roughness above the yardstick's that can be compression error, coarse and fine; more is
+# real picture (an interface bar or menu text crossing the letters), which is kept
+NOISE = (16.0, 9.0)
+CALM = (0.25, 0.01)  # levels squared added to both roughnesses, coarse and fine, so near-flat pictures compare as alike
+# share of the letters' roughness that is real (not compression error), coarse and fine: at or below the first they
+# are filled from around, at or above the second kept, blended between
+FILL = ((0.3, 0.8), (0.1, 0.5))
+PRESENT = 0.5  # share of its full strength the overlay must read at in a frame to be there and be undone
+EDGES = 3.0  # luma pixels: detail finer than this is the overlay's edges, for reading its strength there
+WEAK = 2.0  # luma levels: an overlay adding less than this on average cannot be read, so it is assumed to be there
 
 MEAN_EDGE = 3.0  # luma levels per half-size pixel: a stretch's averaged picture is smoother, a fixed overlay's edge not
 VAR_EDGE = 0.25  # natural-log units per pixel, the same test on the log of the temporal variance
@@ -60,35 +79,32 @@ class Mark:
     kind: str
     opacity: float
     parts: list[Part] = field(default_factory=list, repr=False)  # luma, then u and v (a solid mark: luma only)
-    smooth: float = 0.0
+    _plans: dict = field(default_factory=dict, init=False, repr=False, compare=False)  # per frame size, see _plan
 
     def erase(self, frame: Frame) -> None:
-        """Clean one full-size frame in place, unless that would leave the overlay's outline sharper than it was (so
-        the overlay is not in this frame); pixels outside the overlay are left exactly as they were."""
+        """Clean one full-size frame in place, unless the overlay is not in it; pixels outside the box are left
+        exactly as they were."""
         if self.kind == "solid":
             raise RuntimeError("a solid mark hides the picture completely, so it is filled in, not erased")
-        luma = self.parts[0].where
-        real = self._clean(frame.y[luma].astype(np.float32))
-        if real is None:
+        plans = self._planned(frame)
+        seen, base = _behind(frame.y, plans[0])
+        if not _present(seen, base, plans[0]):
             return
-        frame.y[luma] = real
-        for plane, (where, sel, keep, offset) in zip((frame.u, frame.v), self.parts[1:]):
-            p = plane[where]
-            p[sel] = np.clip(np.rint((p[sel] - offset) / keep), 0, 255)
-            if self.smooth:
-                p[sel] = cv2.bilateralFilter(p, REACH, self.smooth, REACH / 2.5)[sel]
+        _clean(frame.y, seen, base, plans[0])
+        for plane, plan in zip((frame.u, frame.v), plans[1:]):
+            _clean(plane, *_behind(plane, plan), plan)
 
-    def _clean(self, seen: np.ndarray) -> np.ndarray | None:
-        """seen, the float32 luma around the overlay, cleaned; None when that would leave its outline sharper."""
-        _, sel, keep, offset = self.parts[0]
-        real = seen.copy()
-        real[sel] = np.clip(np.rint((seen[sel] - offset) / keep), 0, 255)
-        outline = _outline(self._core())[0]
-        if _edges(real)[outline].mean() >= _edges(seen)[outline].mean():
-            return None
-        if self.smooth:
-            real[sel] = cv2.bilateralFilter(real.astype(np.uint8), REACH, self.smooth, REACH / 2.5)[sel]
-        return real
+    def _planned(self, frame: Frame) -> list[Plan]:
+        """The parts laid out for frame's size, worked out once per size."""
+        if frame.y.shape not in self._plans:
+            self._plans[frame.y.shape] = [_plan(p, self.box, plane.shape, i > 0)
+                                          for i, (p, plane) in enumerate(zip(self.parts, (frame.y, frame.u, frame.v)))]
+        return self._plans[frame.y.shape]
+
+    def _present(self, frame: Frame) -> bool:
+        """Whether the overlay is in frame."""
+        plan = self._planned(frame)[0]
+        return _present(*_behind(frame.y, plan), plan)
 
     def _core(self) -> np.ndarray:
         """The pixels the overlay dims noticeably; a mark may also correct the faint skirt around them."""
@@ -105,17 +121,18 @@ class Mark:
             return self
         if not self.parts[0].sel.any():
             raise RuntimeError(NOTHING)
-        luma, chroma = self.parts[0].where, self.parts[1].where
-        # shortcut: the padded crops of every sampled frame are kept in memory (about 50 MB for a 420x70 box), upgrade
+        (ys, xs), chroma = self.parts[0].where, self.parts[1].where
+        # shortcut: the padded crops of every sampled frame are kept in memory (about 70 MB for a 420x70 box), upgrade
         # by keeping only a sample of them if very large boxes are given
-        fit, held = [], []
+        fit, held, rows = [], [], []
 
         def split(frames: Iterable[Frame]) -> Iterator[Frame]:
-            for i, f in enumerate(f for f in frames if self._clean(f.y[luma].astype(np.float32)) is not None):
+            for i, f in enumerate(f for f in frames if self._present(f)):
                 if i % HOLD:
-                    fit.append(Frame(f.y[luma].copy(), f.u[chroma].copy(), f.v[chroma].copy()))
-                else:
-                    held.append(f.y[luma].astype(np.float32))
+                    fit.append(Frame(f.y[ys, xs].copy(), f.u[chroma].copy(), f.v[chroma].copy()))
+                else:  # with room above and below for the yardstick
+                    rows[:] = max(0, 2 * ys.start - ys.stop), min(f.y.shape[0] & ~1, 2 * ys.stop - ys.start)
+                    held.append(f.y[rows[0]:rows[1], xs].copy())
                 yield f
 
         measured = _measure(*_stats(split(frames), NOTHING), self.box)
@@ -123,11 +140,19 @@ class Mark:
             return measured
 
         def score(m: Mark) -> float:  # on the same outline for both
-            return measured._visibility(r if (r := m._clean(c)) is not None else c for c in held)
+            (my, mx), *rest = m.parts[0]
+            part = Part(np.s_[my.start - rows[0]:my.stop - rows[0], mx.start - xs.start:mx.stop - xs.start], *rest)
+            x, y, w, h = m.box
+            plan = _plan(part, (x - xs.start, y - rows[0], w, h), held[0].shape, False)
 
-        best = min(measured, _fitted(measured, fit), key=score)  # unsmoothed, as smoothing evens them out
-        smoothed = [replace(best, smooth=s) for s in SMOOTH]
-        return next((m for m in smoothed if score(m) <= 1), smoothed[-1])
+            def cleaned(crop: np.ndarray) -> np.ndarray:
+                crop = crop.copy()
+                _clean(crop, *_behind(crop, plan), plan)
+                return crop[part.where].astype(np.float32)
+
+            return measured._visibility(map(cleaned, held))
+
+        return min(measured, _fitted(measured, fit), key=score)
 
     def visibility(self, frames: Iterable[Frame]) -> float:
         """How much sharper the overlay's outline is than nearby picture, averaged over frames; 1.0 means it is gone."""
@@ -139,6 +164,158 @@ class Mark:
         outline, near = _outline(self._core())
         ratios = [(g[outline].mean() + FAINT) / (g[near].mean() + FAINT) for g in map(_edges, lumas)]
         return float(np.mean(ratios)) if ratios else 1.0
+
+
+class Plan(NamedTuple):
+    """A see-through mark's part laid out for one plane size, as maps over a window of the plane around it."""
+    win: tuple[slice, slice]  # the part's padded area, made taller to hold the yardstick
+    sel: np.ndarray  # the overlay's pixels
+    offset: np.ndarray  # its offset, 0 elsewhere
+    dim: np.ndarray  # 1 - keep, 0 elsewhere
+    gain: np.ndarray  # 1 / keep, 1 elsewhere
+    write: np.ndarray  # the pixels changed: the overlay and its rim, inside the box
+    known: np.ndarray  # 1 on the pixels the picture behind is predicted from: neither letters nor yardstick
+    norm: np.ndarray  # what that prediction is normalised by
+    letters: np.ndarray  # 1 on the overlay and its rim
+    yard: np.ndarray | None  # letters moved onto nearby picture without the overlay; None when there is no room
+    near: np.ndarray  # letters spread over NEAR, shrunk as _shrink does, to normalise by
+    shift: int  # rows from the yardstick to the letters
+    solid: np.ndarray  # 0 on the pixel either side of the overlay's edge, 1 elsewhere
+    solid_norm: np.ndarray  # solid spread over SOFT
+    spread: tuple[float, float, float, float, float]  # SPREAD, WIDE, NEAR, SOFT and FINE in this plane's pixels
+    area: slice  # the window's rows that are the part's padded area
+
+
+def _shrink(img: np.ndarray, sigma: float) -> tuple[np.ndarray, int]:
+    """Gaussian blur of each channel, and the factor it is shrunk by: a wide one is worked out at a quarter or half
+    the size, as it has no fine detail to lose."""
+    f = 4 if sigma >= 12 else 2 if sigma >= 6 else 1
+    if f == 1:
+        return cv2.GaussianBlur(img, (0, 0), sigma), 1
+    h, w = img.shape[:2]
+    if h % f or w % f:  # whole multiples resize far faster
+        img = cv2.copyMakeBorder(img, 0, -h % f, 0, -w % f, cv2.BORDER_REFLECT)
+    return cv2.GaussianBlur(cv2.resize(img, None, fx=1 / f, fy=1 / f, interpolation=cv2.INTER_AREA), (0, 0),
+                            sigma / f), f
+
+
+def _grow(small: np.ndarray, f: int, shape: tuple[int, ...]) -> np.ndarray:
+    """small, shrunk by f, back at shape."""
+    if f == 1:
+        return small
+    return cv2.resize(small, (small.shape[1] * f, small.shape[0] * f), interpolation=cv2.INTER_LINEAR)[:shape[0],
+                                                                                                      :shape[1]]
+
+
+def _blur(img: np.ndarray, sigma: float) -> np.ndarray:
+    return _grow(*_shrink(img, sigma), img.shape)
+
+
+def _plan(part: Part, box: tuple[int, int, int, int], shape: tuple[int, int], half: bool) -> Plan:
+    """part laid out for a plane of shape (full size, or half for colour)."""
+    s = 2 if half else 1
+    spread = (SPREAD / s, WIDE / s, NEAR / s, SOFT / s, FINE / s)
+    rim = RIM // s
+    (ys, xs), sel = part.where, part.sel
+    letters = cv2.dilate(sel.astype(np.uint8), np.ones((2 * rim + 1,) * 2, np.uint8)).astype(bool)
+    rows = np.flatnonzero(letters.any(1))
+    t0, t1 = ys.start + rows[0], ys.start + rows[-1] + 1
+    shift, margin = t1 - t0 + rim, int(np.ceil(2 * spread[0]))
+    up, down = t0 - shift, shape[0] - t1 - shift  # rows left beyond the yardstick above and below
+    if up < down:
+        shift = -shift
+    top, bottom = (max(0, up - margin), ys.stop) if shift > 0 else (ys.start, min(shape[0], t1 - shift + margin))
+    h, w = bottom - top, xs.stop - xs.start
+    area = np.s_[ys.start - top:ys.stop - top, :]
+
+    def lay(values, fill: float) -> np.ndarray:
+        out = np.full((h, w), fill, np.float32)
+        out[area][sel] = values
+        return out
+
+    mask = np.zeros((h, w), bool)
+    mask[area] = letters
+    inside = np.zeros((h, w), bool)
+    x, y, bw, bh = (v // s for v in box)
+    inside[y - top:y - top + bh, x - xs.start:x - xs.start + bw] = True
+    # shortcut: an overlay without its own height of room above or below it is undone without the yardstick (kept
+    # as undone), upgrade by moving the yardstick sideways if overlays that tall come
+    yard = np.roll(mask, -shift, 0) if max(up, down) >= 0 else None
+    known = (~(mask | yard if yard is not None else mask)).astype(np.float32)
+    letters_f = mask.astype(np.float32)
+    core = lay(part.keep < OVERLAY, False).astype(np.uint8)
+    k = np.ones((3, 3), np.uint8)
+    solid = 1 - (cv2.dilate(core, k) - cv2.erode(core, k)).astype(np.float32)
+    return Plan(np.s_[top:bottom, xs], lay(True, False).astype(bool), lay(part.offset, 0), lay(1 - part.keep, 0),
+                lay(1 / part.keep, 1), mask & inside, known,
+                np.maximum(_blur(known, spread[0]) + WIDE_SHARE * _blur(known, spread[1]), 1e-6), letters_f, yard,
+                np.maximum(_shrink(letters_f, spread[2])[0], 1e-6),
+                shift, solid, np.maximum(_blur(solid, spread[3]), 1e-6), spread, area[0])
+
+
+def _behind(plane: np.ndarray, p: Plan) -> tuple[np.ndarray, np.ndarray]:
+    """In p's window: the plane as seen, and the picture around the letters carried across them."""
+    seen = plane[p.win].astype(np.float32)
+    known = (seen - p.offset) * p.gain * p.known
+    return seen, (_blur(known, p.spread[0]) + WIDE_SHARE * _blur(known, p.spread[1])) / p.norm
+
+
+def _present(seen: np.ndarray, base: np.ndarray, p: Plan) -> bool:
+    """Whether the overlay is in this frame: its strength read from what it adds to the picture carried across, as a
+    whole and at its edges only. The whole is misread where the picture is about as bright as the overlay and does
+    not quite follow the carried-across average; the edges, where strong real edges cross the letters."""
+    # shortcut: in a frame whose picture is about as bright as the overlay, busy, and crossed by strong edges, both
+    # readings can miss it and the frame is left alone; upgrade by reading against a sharper prediction of the picture
+    rows, sel = p.area, p.sel[p.area]
+    adds, extra = p.offset[rows] - p.dim[rows] * base[rows], seen[rows] - base[rows]
+    if np.mean(adds[sel] ** 2) < WEAK ** 2:
+        return True
+    smooth = _blur(np.dstack([extra, adds]), EDGES)
+    pairs = ((extra, adds), (extra - smooth[..., 0], adds - smooth[..., 1]))
+    return any(float(e[sel] @ a[sel]) >= PRESENT * float(a[sel] @ a[sel]) for e, a in pairs)
+
+
+def _kept(coarse: np.ndarray, fine: np.ndarray, p: Plan) -> tuple[np.ndarray | float, np.ndarray | float]:
+    """How much of the coarse and the fine detail to keep: by the share of the letters' roughness that is real
+    picture, the most the yardstick's roughness and NOISE allow."""
+    if p.yard is None:
+        return 1.0, 1.0
+    energies = np.zeros((*coarse.shape, 4), np.float32)
+    for i, d in enumerate((coarse, fine)):
+        e = energies[..., 2 * i] = d * d
+        if p.shift > 0:  # the yardstick's moved over the letters
+            energies[p.shift:, :, 2 * i + 1] = e[:-p.shift]
+        else:
+            energies[:p.shift, :, 2 * i + 1] = e[-p.shift:]
+    rough, f = _shrink(energies * p.letters[..., None], p.spread[2])
+    rough /= p.near[..., None]
+    kept = []
+    for which in (0, 1):
+        letters, yard = rough[..., 2 * which], rough[..., 2 * which + 1]
+        real = letters - np.clip(letters - yard, 0, NOISE[which])
+        lo, hi = FILL[which]
+        kept.append(np.clip(((real + CALM[which]) / (letters + CALM[which]) - lo) / (hi - lo), 0, 1))
+    kept = _grow(np.dstack(kept), f, coarse.shape)
+    return kept[..., 0], kept[..., 1]
+
+
+def _clean(plane: np.ndarray, seen: np.ndarray, base: np.ndarray, p: Plan) -> None:
+    """Undo the overlay in plane's window, taking out the compression error the yardstick shows is there."""
+    adds = p.offset - p.dim * base
+    soft = _blur(adds, p.spread[3]) - adds  # what softening the overlay's edges adds
+    miss = np.clip(seen - base - adds, -SURE, SURE) * p.letters
+    fit, f = _shrink(np.dstack([miss * soft, soft * soft * p.letters]), p.spread[2])
+    amount = _grow(np.clip(fit[..., 0] / (fit[..., 1] + 1e-3), 0, SOFTEST), f, miss.shape)
+    z = (seen - amount * soft - p.offset) * p.gain
+    # what is left at the edge itself is a thin line, so the pixel either side is filled from its neighbours, unless
+    # that changes it more than compression can have (a real edge crossing)
+    edge = (_blur(z * p.solid, p.spread[3]) / p.solid_norm - z) * (1 - p.solid)
+    z += edge * np.clip(2 - np.abs(edge) / SURE, 0, 1)
+    coarse = _blur(z, p.spread[4]) - base
+    fine = z - base - coarse
+    keep_coarse, keep_fine = _kept(coarse, fine, p)
+    out = base + keep_coarse * coarse + keep_fine * fine
+    plane[p.win][p.write] = np.clip(np.rint(out[p.write]), 0, 255)
 
 
 def _outline(sel: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

@@ -188,7 +188,7 @@ def clean(video: str, box_text: str | None, mark: int | None, out: str | None) -
         # the first frame on; upgrade by starting the filler at each part if long videos with solid overlays come
         n = media.patch(src, dst, _filler(src, chosen, info["width"], info["height"]), progress=_progress())
     else:
-        key = hashlib.sha256(repr((chosen.box, chosen.kind, chosen.smooth, [p.where for p in chosen.parts])).encode()
+        key = hashlib.sha256(repr((chosen.box, chosen.kind, [p.where for p in chosen.parts])).encode()
                              + b"".join(a.tobytes() for p in chosen.parts for a in p[1:])).hexdigest()
         n = media.patch(src, dst, chosen.erase, resume=key, progress=_progress())
     print(f"wrote {dst} ({n} frames)")
