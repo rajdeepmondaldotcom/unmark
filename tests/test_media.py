@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -615,3 +616,58 @@ def test_a_variable_rate_video_is_written_in_one_part(tmp_path, monkeypatch):
     n = media.patch(src, one, invert, crf=0)
     assert media.patch(src, out, invert, crf=0, resume="k", progress=lambda *a: progress.append(a)) == n
     assert raw(out) == raw(one) and video_pts(out) == video_pts(one) and len(progress) == 2
+
+
+def tagged(folder: Path) -> Path:
+    """A 1.6 s .mkv with a title and artist, two chapters, a subtitle, a font attachment and a language on each
+    stream; the video also has a tag of its own."""
+    meta, srt, font = folder / "meta.txt", folder / "sub.srt", folder / "font.ttf"
+    meta.write_text(";FFMETADATA1\ntitle=Night Drive\nartist=Test Band\n"
+                    "[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=800\ntitle=Opening\n"
+                    "[CHAPTER]\nTIMEBASE=1/1000\nSTART=800\nEND=1600\ntitle=Ending\n")
+    srt.write_text("1\n00:00:00,100 --> 00:00:01,000\nHello there\n")
+    font.write_bytes(b"not really a font")
+    return make(folder / "src.mkv", noise(40, seed=16), extra=(
+        "-f", "lavfi", "-i", "sine=duration=1.6", "-i", str(srt), "-i", str(meta), "-attach", str(font),
+        "-map", "0:v", "-map", "1:a", "-map", "2:s", "-map_metadata", "3", "-map_chapters", "3",
+        "-metadata:s:v:0", "language=hin", "-metadata:s:v:0", "VIEW=left", "-metadata:s:a:0", "language=jpn",
+        "-metadata:s:s:0", "language=ita", "-metadata:s:t:0", "mimetype=application/x-truetype-font",
+        "-c:a", "aac", "-c:s", "srt"))
+
+
+def described(path: Path) -> dict:
+    """ffprobe's format, streams and chapters, with tag names in lower case."""
+    out = json.loads(subprocess.run(["ffprobe", "-v", "error", "-show_format", "-show_streams", "-show_chapters",
+                                     "-of", "json", str(path)], capture_output=True, text=True, check=True).stdout)
+    for s in [*out["streams"], out["format"]]:
+        s["tags"] = {k.lower(): v for k, v in s.get("tags", {}).items()}
+    return out
+
+
+def test_the_same_container_keeps_tags_chapters_subtitles_attachments_and_stream_languages(tmp_path, monkeypatch):
+    monkeypatch.setattr(media, "CHUNK_S", 0.25)  # in parts, so the resumable join is the one checked
+    src, out = tagged(tmp_path), tmp_path / "out.mkv"
+    assert media.patch(src, out, invert, crf=0, resume="k") == 40
+    got = described(out)
+    assert {"title": "Night Drive", "artist": "Test Band"}.items() <= got["format"]["tags"].items()
+    assert [c["tags"]["title"] for c in got["chapters"]] == ["Opening", "Ending"]
+    kinds = {s["codec_type"]: s for s in got["streams"]}
+    assert sorted(kinds) == ["attachment", "audio", "subtitle", "video"] and len(got["streams"]) == 4
+    assert kinds["video"]["tags"]["language"] == "hin" and kinds["video"]["tags"]["view"] == "left"
+    assert kinds["audio"]["tags"]["language"] == "jpn" and kinds["subtitle"]["tags"]["language"] == "ita"
+    assert kinds["attachment"]["tags"]["filename"] == "font.ttf"
+    assert b"Hello there" in ff("-i", str(out), "-map", "0:s", "-f", "srt", "-")
+    assert kinds["video"]["tags"]["duration"].startswith("00:00:01.6")  # the output's own 40 frames at 25 fps
+    assert frame_count(out) == 40 and audio_md5(out) == audio_md5(src)
+
+
+def test_another_container_still_succeeds_and_keeps_picture_sound_tags_and_chapters(tmp_path):
+    src, out = tagged(tmp_path), tmp_path / "out.mp4"  # .mp4 cannot hold this subtitle, so it must be left out
+    assert media.patch(src, out, lambda f: None, crf=0) == 40  # in one piece, the way a variable-rate video is
+    got = described(out)
+    assert {"title": "Night Drive", "artist": "Test Band"}.items() <= got["format"]["tags"].items()
+    assert [c["tags"]["title"] for c in got["chapters"]] == ["Opening", "Ending"]
+    picture_and_sound = [(s["codec_type"], s["tags"]["language"]) for s in got["streams"]
+                         if s["codec_type"] != "data"]  # .mp4 stores chapters in a data track of their own
+    assert picture_and_sound == [("video", "hin"), ("audio", "jpn")]
+    assert raw(out) == raw(src) and audio_md5(out) == audio_md5(src)

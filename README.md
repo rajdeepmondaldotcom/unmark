@@ -57,7 +57,9 @@ uv run unmark clean holiday.mp4 --box 478,22,132,60
 
 The cleaned video is called `holiday.clean.mp4`, next to the original (`.clean.mkv` for videos that do not end in
 `.mp4`, `.mov` or `.mkv`). To choose another name, add `--out other-name.mp4`; the name must end in `.mp4`, `.mov` or
-`.mkv`, and must not be the input itself. The sound is copied over untouched.
+`.mkv`, and must not be the input itself. The sound is copied over untouched, every sound track of it. The file's
+tags (title, artist and so on), its chapters and the video's language are kept too, and so are subtitles and
+attachments (such as fonts in an `.mkv`) when the cleaned video ends in the same way as the original (see "Limits").
 
 This is what it printed on a generated 90-second 1080p test video (six scenes, a grey box in the lower left and a
 see-through "MyChannelName" in the lower right):
@@ -185,6 +187,10 @@ These are honest limits of this version.
 - **Disk space.** Joining the parts into the finished video needs both on the disk at once, so about twice the size
   of the cleaned video must be free (see "Picture quality" for sizes). If it is not, it says roughly how many GB to
   free. Parts that can continue (see "Stopping") are kept, so after freeing that the same command finishes the job.
+- **Subtitles and attachments** are kept only when the cleaned video has the same ending as the original (`.mkv` to
+  `.mkv`, say), because another kind of file may not be able to hold them. With `--out` set to another ending, or for
+  an original that is not `.mp4`, `.mov` or `.mkv`, they are left out. Other extra tracks (a timecode or data track,
+  cover art) are always left out.
 - **Scene cuts** for ProPainter are found with a threshold set on test clips, not on real footage.
 - **Untested:** it has never been run on Windows, and never with the real ProPainter. Both are written to work, but
   only the stand-in in `tests/fake_propainter` has been run.

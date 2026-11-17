@@ -47,6 +47,9 @@ KEY_S = 2  # seconds between keyframes
 SPARE = 1.05  # the joined video holds the sound too, so this much more than the parts' size must be free to join them
 # finished parts' names; the digit keeps out the "._" companion files macOS adds beside each on exFAT and FAT disks
 PARTS = "[0-9]*-*.nut"
+# video stream tags that describe the source's encoding, not the picture, so the cleaned video must not copy them
+STALE = {"DURATION", "BPS", "NUMBER_OF_FRAMES", "NUMBER_OF_BYTES", "ENCODER", "_STATISTICS_WRITING_APP",
+         "_STATISTICS_WRITING_DATE_UTC", "_STATISTICS_TAGS"}
 
 
 @dataclass
@@ -142,6 +145,7 @@ def probe(src) -> dict:
         "duration_s": float(data.get("format", {}).get("duration") or video.get("duration") or 0),
         # seconds from the file's first packet to the video's; ffmpeg counts each input's clock from its own start
         "video_start_s": float(video.get("start_time") or 0) - float(data.get("format", {}).get("start_time") or 0),
+        "tags": video.get("tags", {}),
     } | {k: video[k] for k in COLOURS if video.get(k, "unknown") != "unknown"}
 
 
@@ -328,9 +332,17 @@ def patch(src, dst, edit: Callable[[Frame], None], crf: int | None = None, resum
                                    if each else "free that and run the same command again"))
         (work / "parts.txt").write_text("".join(f"file {k:06d}-{n}.nut\nduration {float(n / fps):.6f}\n"
                                                 for k, n in enumerate(done)), "utf-8")
+        # shortcut: subtitles and attachments are copied only into the source's own kind of file, as one the output
+        # cannot hold would fail the whole join; upgrade by converting subtitles if people ask for them across kinds
+        same = dst.suffix.lower() == src.suffix.lower()
+        # the video comes from the parts, so its tags are copied from the source, less those that describe its old
+        # encoding (Matroska's duration and mkvmerge's statistics, read as "BPS-eng" and the like)
+        tags = {k: v for k, v in info["tags"].items() if k.split("-")[0].upper() not in STALE}
         _run([_bin("ffmpeg"), "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
               "-itsoffset", f"{info['video_start_s']:.6f}", "-f", "concat", "-i", str(work / "parts.txt"),
-              "-i", str(src), "-map", "0:v", "-map", "1:a?", "-c", "copy",
+              "-i", str(src), "-map", "0:v", "-map", "1:a?", *(["-map", "1:s?", "-map", "1:t?"] if same else []),
+              "-map_metadata", "1", "-map_chapters", "1",
+              *(a for k, v in tags.items() for a in ("-metadata:s:v:0", f"{k}={v}")), "-c", "copy",
               # hvc1, not ffmpeg's default hev1: Apple's players open only hvc1 HEVC in .mp4 and .mov
               *(["-tag:v", "hvc1"] if hardware and dst.suffix.lower() != ".mkv" else []),
               "-f", MUXERS[dst.suffix.lower()], str(joined)])
