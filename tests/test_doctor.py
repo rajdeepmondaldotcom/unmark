@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import os
-import platform
 import re
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+from helpers import HEVC, failing_ffmpeg
 
 from unmark import cli
 
@@ -29,29 +27,23 @@ def test_doctor_passes_here_and_runs_ffmpeg_end_to_end(capsys, monkeypatch):
 
 def test_doctor_names_the_encoder_cleaning_will_use(capsys, monkeypatch):
     monkeypatch.delenv("UNMARK_PROPAINTER", raising=False)
-    hevc = sys.platform == "darwin" and platform.machine() == "arm64" and "hevc_videotoolbox" in subprocess.run(
-        ["ffmpeg", "-hide_banner", "-encoders"], check=False, capture_output=True, text=True).stdout
 
     assert cli.main(["doctor"]) == 0
 
-    want = "hevc_videotoolbox (this Mac's hardware encoder)" if hevc else "libx264"
+    want = "hevc_videotoolbox (this Mac's hardware encoder)" if HEVC else "libx264"
     assert f"[ok] encoder: {want}\n" in capsys.readouterr().out
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the stand-in ffmpeg is a shell script")
 def test_doctor_says_when_the_hardware_encoder_will_not_start(capsys, monkeypatch, tmp_path):
-    fake = tmp_path / "ffmpeg"
-    fake.write_text(f'#!/bin/sh\ncase "$*" in *hevc_videotoolbox*) echo "no encoder here" >&2; exit 1;; esac\n'
-                    f'exec "{shutil.which("ffmpeg")}" "$@"\n')
-    fake.chmod(0o755)
-    monkeypatch.setenv("UNMARK_FFMPEG", str(fake))
+    monkeypatch.setenv("UNMARK_FFMPEG", str(failing_ffmpeg(tmp_path)))
     monkeypatch.delenv("UNMARK_PROPAINTER", raising=False)
 
     assert cli.main(["doctor"]) == 0
 
     said = capsys.readouterr().out
     assert "[ok] encoder: libx264" in said and "[ok] end-to-end run:" in said
-    if sys.platform == "darwin" and platform.machine() == "arm64":
+    if HEVC:
         assert "libx264 (hevc_videotoolbox is listed but did not start: ffmpeg failed (1): no encoder here)" in said
 
 

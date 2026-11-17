@@ -2,11 +2,28 @@
 
 from __future__ import annotations
 
+import platform
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+# whether this computer has the hardware encoder unmark prefers: an Apple-silicon Mac whose ffmpeg lists it
+HEVC = sys.platform == "darwin" and platform.machine() == "arm64" and "hevc_videotoolbox" in subprocess.run(
+    ["ffmpeg", "-hide_banner", "-encoders"], check=False, capture_output=True, text=True).stdout
+
+
+def failing_ffmpeg(folder: Path) -> Path:
+    """A stand-in ffmpeg (a shell script) in folder that fails whenever hevc_videotoolbox is asked for, like a busy or
+    broken hardware encoder, and runs the real ffmpeg otherwise."""
+    fake = folder / "ffmpeg"
+    fake.write_text(f'#!/bin/sh\ncase "$*" in *hevc_videotoolbox*) echo "no encoder here" >&2; exit 1;; esac\n'
+                    f'exec "{shutil.which("ffmpeg")}" "$@"\n')
+    fake.chmod(0o755)
+    return fake
 
 
 def clean_frames(n: int = 150, w: int = 320, h: int = 180, seed: int = 0) -> np.ndarray:

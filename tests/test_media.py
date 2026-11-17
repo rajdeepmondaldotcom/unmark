@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import platform
 import shutil
 import subprocess
 import sys
@@ -12,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from helpers import HEVC, failing_ffmpeg
 
 from unmark import media
 
@@ -302,7 +301,7 @@ def number(y: np.ndarray) -> int:
 
 
 def test_planes_far_apart_seeks_each_sample_and_matches_a_full_decode(tmp_path):
-    n = 2400  # 40 s at 60 fps: 4 samples are 600 frames apart, past the seek rule; 5 are 480 apart, under it
+    n = 2400  # 40 s at 60 fps: 4 samples are 600 frames apart, past the seek rule (the short clips stay under it)
     src = make(tmp_path / "src.mp4", counted(n), fps=60, extra=("-g", "120", "-preset", "ultrafast"))
     full = np.frombuffer(raw(src), np.uint8).reshape(-1, SIZE)
     assert len(full) == n and [number(f[:W * H].reshape(H, W)) for f in full[::599]] == list(range(0, n, 599))
@@ -400,33 +399,57 @@ def invert(f: media.Frame) -> None:
     f.y[:8, :8] = 255 - f.y[:8, :8]
 
 
+def stopping(at: int) -> tuple[Callable, list[int]]:
+    """An edit that inverts a corner and fails as an unplugged disk would on its at-th frame (never with 0), and the
+    list it adds one entry to per frame it is given."""
+    calls: list[int] = []
+
+    def edit(f: media.Frame) -> None:
+        calls.append(1)
+        if len(calls) == at:
+            raise OSError("disk unplugged")
+        invert(f)
+
+    return edit, calls
+
+
 def test_an_unfinished_run_continues_from_its_finished_parts(tmp_path, monkeypatch):
     monkeypatch.setattr(media, "CHUNK_S", 0.2)  # 6 frames per part
     src = make(tmp_path / "src.mp4", noise(40, seed=9), fps=30, extra=SOUND)
     want = tmp_path / "want.mp4"
     media.patch(src, want, invert, crf=0)
-    calls = 0
-
-    def edit(f: media.Frame) -> None:
-        nonlocal calls
-        calls += 1
-        if calls == fail_at:
-            raise OSError("disk unplugged")
-        invert(f)
-
     out, progress = tmp_path / "out.mp4", []
-    for key, again, encoded in (("a", "a", 40 - 12), ("a", "b", 40)):  # the same key keeps the two finished parts
-        calls, fail_at = 0, 15
-        out.unlink(missing_ok=True)
-        with pytest.raises(OSError, match="unplugged"):
-            media.patch(src, out, edit, crf=0, resume=key)
-        assert not out.exists()
-        calls, fail_at = 0, 0
-        progress.clear()
-        assert media.patch(src, out, edit, crf=0, resume=again, progress=lambda *a: progress.append(a)) == 40
-        assert calls == encoded and progress[0][0] == 40 - encoded, key + again
-        assert raw(out) == raw(want) and audio_md5(out) == audio_md5(src)
-        assert sorted(p.name for p in tmp_path.iterdir()) == ["out.mp4", "src.mp4", "want.mp4"]
+    edit, _ = stopping(15)
+    with pytest.raises(OSError, match="unplugged"):
+        media.patch(src, out, edit, crf=0, resume="a")
+    assert not out.exists()
+    edit, calls = stopping(0)
+    assert media.patch(src, out, edit, crf=0, resume="a", progress=lambda *a: progress.append(a)) == 40
+    assert len(calls) == 40 - 12 and progress[0][0] == 12  # the two finished parts were kept and used
+    assert raw(out) == raw(want) and audio_md5(out) == audio_md5(src)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["out.mp4", "src.mp4", "want.mp4"]
+
+
+def test_finished_parts_of_a_different_run_are_never_deleted(tmp_path, monkeypatch):
+    monkeypatch.setattr(media, "CHUNK_S", 0.2)  # 6 frames per part
+    src, out = make(tmp_path / "src.mp4", noise(40, seed=9), fps=30, extra=SOUND), tmp_path / "out.mp4"
+    edit, _ = stopping(15)
+    with pytest.raises(OSError, match="unplugged"):
+        media.patch(src, out, edit, crf=0, resume="a")
+    with pytest.raises(RuntimeError, match=r"out\.mp4\.parts.*kept.*run the earlier command again.*delete"):
+        media.patch(src, out, invert, crf=0, resume="b")
+    edit, calls = stopping(0)
+    assert media.patch(src, out, edit, crf=0, resume="a") == 40 and len(calls) == 40 - 12  # still there
+
+
+def test_a_run_stopped_before_its_first_part_is_replaced_without_asking(tmp_path, monkeypatch):
+    monkeypatch.setattr(media, "CHUNK_S", 0.2)  # 6 frames per part
+    src, out = make(tmp_path / "src.mp4", noise(40, seed=9), fps=30, extra=SOUND), tmp_path / "out.mp4"
+    edit, _ = stopping(3)
+    with pytest.raises(OSError, match="unplugged"):
+        media.patch(src, out, edit, crf=0, resume="a")
+    edit, calls = stopping(0)
+    assert media.patch(src, out, edit, crf=0, resume="b") == 40 and len(calls) == 40
 
 
 def test_a_video_of_exactly_whole_parts(tmp_path, monkeypatch):
@@ -445,8 +468,6 @@ def stream(path: Path) -> tuple[str, str]:
     return tuple(out.strip().split(","))
 
 
-HEVC = sys.platform == "darwin" and platform.machine() == "arm64" and "hevc_videotoolbox" in subprocess.run(
-    ["ffmpeg", "-hide_banner", "-encoders"], check=False, capture_output=True, text=True).stdout
 needs_hevc = pytest.mark.skipif(not HEVC, reason="needs an Apple-silicon Mac whose ffmpeg lists hevc_videotoolbox")
 
 
@@ -472,24 +493,13 @@ def test_a_resumed_default_run_matches_an_uninterrupted_one(tmp_path, monkeypatc
     src = late(tmp_path / "src.mkv", drift(50, 7, 120))
     one = tmp_path / "one.mp4"
     assert media.patch(src, one, invert) == 50
-    calls, remembered = 0, []
-
-    def edit(f: media.Frame) -> None:
-        nonlocal calls
-        calls += 1
-        if calls == fail_at:
-            raise OSError("disk unplugged")
-        invert(f)
-
-    def progress(*_) -> None:
-        remembered.append(json.loads((tmp_path / "out.mp4.parts" / "run.json").read_text("utf-8"))["encoder"])
-
-    out, fail_at = tmp_path / "out.mp4", 13
+    edit, calls = stopping(13)
+    out = tmp_path / "out.mp4"
     with pytest.raises(OSError, match="unplugged"):
         media.patch(src, out, edit, resume="k")
-    calls, fail_at = 0, 0
-    assert media.patch(src, out, edit, resume="k", progress=progress) == 50
-    assert calls == 40 and set(remembered) == {"hevc_videotoolbox"}
+    edit, calls = stopping(0)
+    assert media.patch(src, out, edit, resume="k") == 50
+    assert len(calls) == 40  # the two finished parts were kept and used
     assert stream(out) == stream(one) == ("hevc", "hvc1")
     assert frame_count(out) == 50 and video_pts(out) == video_pts(one) and audio_md5(out) == audio_md5(src)
     assert start(out, "v") - start(out, "a") == start(one, "v") - start(one, "a")
@@ -508,22 +518,44 @@ def test_an_explicit_crf_gives_h264_and_crf_0_stays_exact(tmp_path):
 @needs_hevc
 @pytest.mark.skipif(sys.platform == "win32", reason="the stand-in ffmpeg is a shell script")
 def test_a_hardware_encoder_that_will_not_start_falls_back_to_libx264(tmp_path, monkeypatch):
-    fake = tmp_path / "ffmpeg"
-    fake.write_text(f'#!/bin/sh\ncase "$*" in *hevc_videotoolbox*) echo "no encoder here" >&2; exit 1;; esac\n'
-                    f'exec "{shutil.which("ffmpeg")}" "$@"\n')
-    fake.chmod(0o755)
-    monkeypatch.setenv("UNMARK_FFMPEG", str(fake))
+    monkeypatch.setenv("UNMARK_FFMPEG", str(failing_ffmpeg(tmp_path)))
     monkeypatch.setattr(media, "CHUNK_S", 0.2)
     why = "hevc_videotoolbox is listed but did not start: ffmpeg failed (1): no encoder here"
     assert media.encoder() == ("libx264", why)
     src = make(tmp_path / "src.mp4", noise(20, seed=14), extra=SOUND)
-    out, remembered = tmp_path / "out.mp4", []
+    out = tmp_path / "out.mp4"
+    assert media.patch(src, out, invert, resume="k") == 20
+    assert stream(out)[0] == "h264" and frame_count(out) == 20
 
-    def progress(*_) -> None:
-        remembered.append(json.loads((tmp_path / "out.mp4.parts" / "run.json").read_text("utf-8"))["encoder"])
 
-    assert media.patch(src, out, invert, resume="k", progress=progress) == 20
-    assert stream(out)[0] == "h264" and frame_count(out) == 20 and set(remembered) == {"libx264"}
+@needs_hevc
+@pytest.mark.skipif(sys.platform == "win32", reason="the stand-in ffmpeg is a shell script")
+def test_finished_hardware_parts_are_kept_when_the_hardware_encoder_does_not_start_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(media, "CHUNK_S", 0.2)  # 5 frames per part at 25 fps
+    src, out = make(tmp_path / "src.mp4", drift(50, 7, 120), extra=SOUND), tmp_path / "out.mp4"
+    edit, calls = stopping(13)
+    with pytest.raises(OSError, match="unplugged"):
+        media.patch(src, out, edit, resume="k")
+    monkeypatch.setenv("UNMARK_FFMPEG", str(failing_ffmpeg(tmp_path)))  # busy this time
+    with pytest.raises(RuntimeError, match="hevc_videotoolbox did not start this time.*kept.*try again"):
+        media.patch(src, out, edit, resume="k")
+    monkeypatch.delenv("UNMARK_FFMPEG")
+    edit, calls = stopping(0)
+    assert media.patch(src, out, edit, resume="k") == 50
+    assert len(calls) == 40 and stream(out)[0] == "hevc"  # the two finished parts were still there
+
+
+def test_a_join_that_will_not_fit_on_the_disk_says_how_much_to_free_and_keeps_the_parts(tmp_path, monkeypatch):
+    monkeypatch.setattr(media, "CHUNK_S", 0.2)  # 6 frames per part
+    src, out = make(tmp_path / "src.mp4", noise(40, seed=15), fps=30, extra=SOUND), tmp_path / "out.mp4"
+    usage = shutil.disk_usage
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: usage(path)._replace(free=0))
+    with pytest.raises(RuntimeError, match=r"about [\d.]+ GB.*kept.*same command"):
+        media.patch(src, out, invert, crf=0, resume="k")
+    assert not out.exists()
+    monkeypatch.setattr(shutil, "disk_usage", usage)
+    edit, calls = stopping(0)
+    assert media.patch(src, out, edit, crf=0, resume="k") == 40 and calls == []  # every part was kept
 
 
 def test_a_variable_rate_video_is_written_in_one_part(tmp_path, monkeypatch):

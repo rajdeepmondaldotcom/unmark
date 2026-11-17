@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import math
 import os
 import platform
 import shutil
@@ -32,13 +33,18 @@ CUT_WIDTH = 160  # pixels; scene cuts are looked for on a picture this wide, whi
 CUT_SCORE = 5
 CHUNK_S = 300  # seconds of video in each part of a resumable patch; a stopped run loses at most the part it was on
 STEADY = 500  # packets checked to tell a steady frame rate from a variable one
-SEEK = 500  # frames per sample above which each sample is read with its own seek instead of decoding everything
+# frames per sample above which each sample is read with its own seek instead of decoding everything: a seek decodes
+# about half a keyframe gap (2 to 6 s on real 60 fps footage, so about 120 frames) plus starting ffmpeg
+SEEK = 200
 SEEKERS = 4  # seeks run at once; each ffmpeg is multi-threaded already, and each holds one decoded frame
-# Apple silicon's HEVC encoder at -q:v 80 measured closer to the source than libx264 crf 16, smaller and faster
+CRF = 16  # libx264's crf when none is given
+# Apple silicon's HEVC encoder at QUALITY measured closer to the source than libx264 at CRF, smaller and faster
 # shortcut: hevc_nvenc on Windows with an NVIDIA card probably helps the same way but has never been run, upgrade by
 # measuring it there the way videotoolbox was measured
 HARDWARE = "hevc_videotoolbox"
+QUALITY = 80  # HARDWARE's -q:v, 1 to 100
 KEY_S = 2  # seconds between keyframes
+SPARE = 1.05  # the joined video holds the sound too, so this much more than the parts' size must be free to join them
 
 
 @dataclass
@@ -232,9 +238,10 @@ def cuts(src) -> list[int]:
     return [int(line.split()[0][6:]) for line in out.splitlines() if line.startswith("frame:")]
 
 
-def _stream(src: Path, pix_fmt: str, vf: str, w: int, h: int, **seek) -> Iterator[Frame]:
+def _stream(src: Path, pix_fmt: str, vf: str, w: int, h: int, ss: float | None = None, frames: int = 0
+            ) -> Iterator[Frame]:
     with tempfile.TemporaryFile() as log:
-        p = _decode(src, pix_fmt, vf, log, **seek)
+        p = _decode(src, pix_fmt, vf, log, ss, frames)
         try:
             for _, frame in _frames(p, w, h):
                 yield frame
@@ -264,69 +271,85 @@ def patch(src, dst, edit: Callable[[Frame], None], crf: int | None = None, resum
     src, dst = Path(src), Path(dst)
     info = probe(src)
     fps = Fraction(info["fps"])
-    per = round(CHUNK_S * fps) if resume is not None and _steady(src, fps) else 0  # 0: one part, the whole video
-    work, part = dst.with_name(dst.name + ".parts"), dst.with_name(dst.name + ".part")
-    run = {"key": resume, "size": src.stat().st_size, "mtime": src.stat().st_mtime_ns, "crf": crf, "frames": per}
+    # shortcut: a variable-rate video is written in one part and cannot resume, as a seek there cannot be sure to land
+    # on a part's first frame; upgrade by seeking to each part's own time if long variable-rate videos come
+    each = round(CHUNK_S * fps) if resume is not None and _steady(src, fps) else 0  # frames per part; 0: just one
+    work, joined = dst.with_name(dst.name + ".parts"), dst.with_name(dst.name + ".part")
+    run = {"key": resume, "size": src.stat().st_size, "mtime": src.stat().st_mtime_ns, "crf": crf, "frames": each}
     try:
         old = json.loads((work / "run.json").read_text("utf-8"))
-        same = per and {k: v for k, v in old.items() if k != "encoder"} == run
+        same = {k: v for k, v in old.items() if k != "encoder"} == run
     except (OSError, ValueError, AttributeError):
-        same = False
+        old, same = {}, False
     # an earlier run that fell back to libx264 keeps it, so its parts are not thrown away if the hardware is back
     run["encoder"] = "libx264" if crf is not None or same and old.get("encoder") == "libx264" else encoder()[0]
-    kept = same and old.get("encoder") == run["encoder"]
-    if not kept:  # never mix parts from different runs
+    finished = sorted(work.glob("*-*.nut")) if resume is not None else []
+    if not (each and same and old.get("encoder") == run["encoder"]):  # never mix parts from different runs
+        if finished and same and old.get("encoder") == HARDWARE:
+            raise RuntimeError(f"{HARDWARE} did not start this time, and the finished parts in {work} were made with "
+                               "it; they are kept, so try again (or delete that folder to start over without it)")
+        if finished:
+            raise RuntimeError(f"{work} holds finished parts of an earlier run that differs from this one (another "
+                               "video, overlay, setting or version of unmark); they are kept: to continue them, run "
+                               "the earlier command again, or delete that folder to start over")
         if work.exists():
             shutil.rmtree(work)
         work.mkdir()
         (work / "run.json").write_text(json.dumps(run), "utf-8")
-    done = [int(p.stem.split("-")[1]) for p in sorted(work.glob("*-*.nut"))]
-    about = round(info["duration_s"] * fps)
+    done = [int(p.stem.split("-")[1]) for p in finished]  # frames in each finished part
+    total = round(info["duration_s"] * fps)
+    hardware = run["encoder"] == HARDWARE
+    quality = ["-q:v", str(QUALITY)] if hardware else ["-crf", str(CRF if crf is None else crf)]
+    codec = ["-c:v", run["encoder"], *quality]
     try:
         if progress:
-            progress(sum(done), about)
-        while not done or (per and done[-1] == per):
-            n = _encode(src, work / f"{len(done):06d}", edit, info, run, per, len(done) * per)
+            progress(sum(done), total)
+        while not done or (each and done[-1] == each):
+            n = _encode(src, work / f"{len(done):06d}", edit, info, codec, each, len(done) * each)
             if not n:
                 break
             done.append(n)
             if progress:
-                progress(sum(done), about)
+                progress(sum(done), total)
+        need = SPARE * sum(p.stat().st_size for p in work.glob("*-*.nut"))
+        free = shutil.disk_usage(dst.parent).free
+        if need > free:  # the join needs the parts and the whole joined video on the disk at once
+            raise RuntimeError(f"joining the cleaned video needs about {math.ceil((need - free) / 1e9)} GB more free "
+                               f"space on the disk of {dst}; " + (
+                                   "the finished parts are kept, so free that and the same command finishes the job"
+                                   if each else "free that and run the same command again"))
         (work / "parts.txt").write_text("".join(f"file {k:06d}-{n}.nut\nduration {float(n / fps):.6f}\n"
                                                 for k, n in enumerate(done)), "utf-8")
         _run([_bin("ffmpeg"), "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
               "-itsoffset", f"{info['video_start_s']:.6f}", "-f", "concat", "-i", str(work / "parts.txt"),
               "-i", str(src), "-map", "0:v", "-map", "1:a?", "-c", "copy",
               # hvc1, not ffmpeg's default hev1: Apple's players open only hvc1 HEVC in .mp4 and .mov
-              *(["-tag:v", "hvc1"] if run["encoder"] == HARDWARE and dst.suffix.lower() != ".mkv" else []),
-              "-f", MUXERS[dst.suffix.lower()], str(part)])
-        part.replace(dst)
+              *(["-tag:v", "hvc1"] if hardware and dst.suffix.lower() != ".mkv" else []),
+              "-f", MUXERS[dst.suffix.lower()], str(joined)])
+        joined.replace(dst)
     except BaseException:
-        if not per:  # nothing a later run could pick up
+        if not each:  # nothing a later run could pick up
             shutil.rmtree(work, ignore_errors=True)
         raise
     finally:
-        part.unlink(missing_ok=True)
+        joined.unlink(missing_ok=True)
     shutil.rmtree(work, ignore_errors=True)
     return sum(done)
 
 
-def _encode(src: Path, name: Path, edit: Callable[[Frame], None], info: dict, run: dict, frames: int,
+def _encode(src: Path, name: Path, edit: Callable[[Frame], None], info: dict, codec: list[str], frames: int,
             first: int) -> int:
-    """Encode, video only, with run's encoder and crf, up to frames frames (all without frames) from frame number first
+    """Encode, video only, with the codec arguments, up to frames frames (all without frames) from frame number first
     into name-<count>.nut; returns the count, and writes no file for none."""
     w, h, pf = info["width"], info["height"], info["pix_fmt"]
-    tmp = name.with_suffix(".tmp")
+    tmp = name.with_name(f"{name.name}.{os.getpid()}.tmp")  # its own name, so two runs never write into one file
     # half a frame early: containers round times (Matroska to 1 ms), and a frame rounded down must not be skipped
     ss = info["video_start_s"] + (first - 0.5) / Fraction(info["fps"]) if first else None
     enc_args = [_bin("ffmpeg"), "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
                 "-f", "rawvideo", "-pix_fmt", pf, "-s", f"{w}x{h}", "-framerate", info["fps"],
                 *(a for k, o in COLOURS.items() if k in info for a in (o, info[k])), "-i", "-",
                 # a fine time base, so the late-start shift when the parts are joined is not rounded to a whole frame
-                "-vf", "settb=1/90000", "-enc_time_base:v", "filter",
-                "-c:v", run["encoder"],
-                *(["-q:v", "80"] if run["encoder"] == HARDWARE
-                  else ["-crf", str(16 if run["crf"] is None else run["crf"])]),
+                "-vf", "settb=1/90000", "-enc_time_base:v", "filter", *codec,
                 "-g", str(round(KEY_S * Fraction(info["fps"]))), "-pix_fmt", pf, "-f", "nut", str(tmp)]
     n = 0
     try:
@@ -354,6 +377,8 @@ def _encode(src: Path, name: Path, edit: Callable[[Frame], None], info: dict, ru
             if dec.returncode != 0:
                 raise _fail(dec, dlog)
         if n:
+            with open(tmp, "rb+") as f:  # on the disk before it looks finished, so a lost disk cannot cut it short
+                os.fsync(f.fileno())
             tmp.replace(name.with_name(f"{name.name}-{n}.nut"))
     finally:
         tmp.unlink(missing_ok=True)
