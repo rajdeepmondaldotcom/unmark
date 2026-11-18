@@ -107,19 +107,22 @@ downloaded), against the decoded original. Higher dB means closer to the origina
 
 | setting | luma PSNR | VMAF | size of the whole video |
 |---|---|---|---|
-| Mac hardware HEVC, quality 74 (used on a Mac) | 46.5 / 46.8 dB | 96.0 / 99.8 | about 65 GB |
-| Mac hardware HEVC, quality 80 | 48.2 / 48.4 dB | 96.7 / 99.8 | about 94 GB |
-| Mac hardware HEVC, quality 68 | 45.3 / 45.6 dB | 94.2 / 99.8 | about 47 GB |
+| Mac hardware HEVC, quality 74 (used on a Mac) | 46.5 / 46.8 dB | 96.0 / 99.8 | 68.9 GB (a whole run) |
+| Mac hardware HEVC, quality 80 | 48.2 / 48.4 dB | 96.7 / 99.8 | about 101 GB |
+| Mac hardware HEVC, quality 68 | 45.3 / 45.6 dB | 94.2 / 99.8 | about 50 GB |
 | libx264 crf 16 (used elsewhere) | 48.2 / 45.8 dB | not measured | 172 to 195 GB |
 | lossless libx264 | exact | 100 | 1,500 to 2,100 GB |
 
 The hardware rows are a fast, strongly coloured piece and a detailed one, 5 seconds each; the libx264 row is two other
-12-second pieces. The 94 GB comes from a real run at quality 80 that wrote 53% of the video in 50 GB, and the other
-hardware sizes are scaled from it. Quality 74 is the lowest setting whose worst frames stayed within one VMAF point of
-quality 80's (95.2 on both pieces, against 96.2 and 95.8); at 68 the fast piece's worst frame fell to 92.8. libx265
+12-second pieces. Quality 74's size is a real run of the whole video (a GB here is a billion bytes, as Finder counts).
+Quality 80's comes from a real run that wrote 53% of the video in 53 GB, and quality 68's is scaled from it. Outside
+the overlay's box, the whole quality 74 run measured 45.5 to 50.7 dB at 15 moments spread over the video. Quality 74
+is the lowest setting whose worst frames stayed within one VMAF point of quality 80's (95.2 on both pieces, against
+96.2 and 95.8); at 68 the fast piece's worst frame fell to 92.8. libx265
 and SVT-AV1 at their fast presets were tried too: at the same closeness they were no smaller on the detailed piece and
 took 5 to 60 times the processor time per frame. The hardware encoder wrote 35 to 57 frames a second at this size on
-an idle Apple M4 at quality 80, and far fewer while the graphics chip was busy with other work.
+an idle Apple M4 at quality 80, and far fewer while the graphics chip was busy with other work. The whole run at
+quality 74 averaged 53.
 
 So a lossless copy of that video would need 1.5 to 2 TB, which is why it is not the default.
 
@@ -185,7 +188,10 @@ These are honest limits of this version.
   re-encoded with libx264 there; the Mac's hardware encoder is faster. This is one machine; a slower computer will
   take longer. A run that continues after a stop (see "Stopping") skips the measuring and the first check, and starts
   writing straight away.
-  <!-- real-video numbers go here -->
+  On the 5 hour 33 minute 4K video above (1,198,496 frames), with `--box`, the same Mac took 15 minutes to measure
+  the overlay, 6 hours 17 minutes to write the cleaned parts, and 1 hour 43 minutes to join them into one file and
+  check it: 8 hours 15 minutes in all. The join only copies what is already written, so its time is the disk's. That
+  disk was an external SSD on a USB 2 link, about 37 MB a second for reading and writing together.
 - **Stopping.** With a see-through overlay, the cleaned video is written in parts of 5 minutes of video, which are
   kept if it stops (Ctrl-C, sleep, a lost disk). Run the same command again, with the same `--box` or `--mark`, and it
   continues from the last finished part. It does not measure the overlay again: it uses the measurement it saved
