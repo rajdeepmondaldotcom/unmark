@@ -23,6 +23,10 @@ APART = 32.0  # luma levels: the flat colour's opacity is solved from the means 
 FLOOR = 0.15
 PEAK = 10  # percentile of an overlay's keep taken as its peak; the very lowest few are noise or passing scenery
 HOLD = 4  # every this-many-th sampled frame is kept out of measuring, to choose the measurement that cleans it best
+# robust spreads (1.4826 x the median absolute deviation) by which a frame's mark on the stray pixels, against the
+# pixels beside them, must stand out to be measured without: on the real video's 1,000 sampled frames, the 7 with the
+# game's map screen across the overlay sat 45 to 56 spreads out and every other frame -22 to +13
+PRINTED = 30.0
 FAINT = 1.0  # luma levels per pixel: an outline gradient this weak cannot be seen, so visibility counts it as none
 # Compression leaves errors of a few levels at and inside the overlay's letters, different in every frame, which undoing
 # it keeps. The part shaped like the overlay's edges softened is fitted and taken out; the rest is judged by comparing
@@ -163,8 +167,9 @@ class Mark:
         if not self.parts[0].sel.any():
             raise RuntimeError(NOTHING)
         (ys, xs), chroma = self.parts[0].where, self.parts[1].where
-        # shortcut: the padded crops of every sampled frame are kept in memory (about 70 MB for a 420x70 box), upgrade
-        # by keeping only a sample of them if very large boxes are given
+        # shortcut: the padded crops of every sampled frame are kept in memory (about 70 MB for a 420x70 box), to
+        # measure again without the frames that print something else in; upgrade by keeping only a sample of them if
+        # very large boxes are given
         fit, held, rows = [], [], []
 
         def split(frames: Iterable[Frame]) -> Iterator[Frame]:
@@ -177,30 +182,55 @@ class Mark:
                     fit.append(Frame(f.y[ys, xs].copy(), f.u[chroma].copy(), f.v[chroma].copy()))
                 else:  # with room above and below for the yardstick
                     rows[:] = max(0, 2 * ys.start - ys.stop), min(f.y.shape[0] & ~1, 2 * ys.stop - ys.start)
-                    held.append(f.y[rows[0]:rows[1], xs].copy())
+                    held.append(Frame(f.y[rows[0]:rows[1], xs].copy(), f.u[chroma].copy(), f.v[chroma].copy()))
                 i += 1
                 yield f
 
-        measured = _measure(*_stats(split(frames), NOTHING), self.box)
+        mean, var = _stats(split(frames), NOTHING)
+        measured = _measure(mean, var, self.box)
         if not measured.parts[0].sel.any():
             raise RuntimeError(NOTHING)
         if not held:
             return measured
 
-        def score(m: Mark) -> float:  # on the same outline for both
-            (my, mx), *rest = m.parts[0]
-            part = Part(np.s_[my.start - rows[0]:my.stop - rows[0], mx.start - xs.start:mx.stop - xs.start], *rest)
-            x, y, w, h = m.box
-            plan = _plan(part, (x - xs.start, y - rows[0], w, h), held[0].shape, False)
+        def best(measured: Mark, fit: list[Frame], held: list[Frame]) -> tuple[Mark, np.ndarray]:
+            """Whichever of measured and its line fit cleans held best, and measured's stray pixels: overlay the
+            line fit reads as not dimmed."""
+            fitted = _fitted(measured, fit)
+            keep = np.ones(measured.parts[0].sel.shape, np.float32)
+            keep[fitted.parts[0].sel] = fitted.parts[0].keep
 
-            def cleaned(crop: np.ndarray) -> np.ndarray:
-                crop = crop.copy()
-                _clean(crop, *_behind(crop, plan), plan)
-                return crop[part.where].astype(np.float32)
+            def score(m: Mark) -> float:  # on the same outline for both
+                (my, mx), *rest = m.parts[0]
+                part = Part(np.s_[my.start - rows[0]:my.stop - rows[0], mx.start - xs.start:mx.stop - xs.start], *rest)
+                x, y, w, h = m.box
+                plan = _plan(part, (x - xs.start, y - rows[0], w, h), (rows[1] - rows[0], xs.stop - xs.start), False)
 
-            return measured._visibility(map(cleaned, held))
+                def cleaned(crop: Frame) -> np.ndarray:
+                    crop = crop.y.copy()
+                    _clean(crop, *_behind(crop, plan), plan)
+                    return crop[part.where].astype(np.float32)
 
-        return min(measured, _fitted(measured, fit), key=score)
+                return measured._visibility(map(cleaned, held))
+
+            return min(measured, fitted, key=score), measured.parts[0].sel & (keep >= OVERLAY)
+
+        chosen, stray = best(measured, fit, held)
+        area = slice(ys.start - rows[0], ys.stop - rows[0])  # the held crops' rows that are the padded area
+        crops = fit + [Frame(h.y[area], h.u, h.v) for h in held]
+        out = _printed(measured.parts[0].sel, stray, mean[0][ys, xs], [c.y for c in crops])
+        if not out.any():
+            return chosen
+        # measure again without them: their stats replace those of the padded area, the only part _measure reads
+        kept_mean, kept_var = _stats(c for c, o in zip(crops, out) if not o)
+        for full, part, where in zip(mean + var, kept_mean + kept_var, ((ys, xs), chroma, chroma) * 2):
+            full[where] = part
+        again = _measure(mean, var, self.box)
+        if not again.parts[0].sel.any():
+            return chosen
+        second, fewer = best(again, [c for c, o in zip(fit, out) if not o],
+                             [h for h, o in zip(held, out[len(fit):]) if not o])
+        return second if fewer.sum() < stray.sum() else chosen
 
     def visibility(self, frames: Iterable[Frame]) -> float:
         """How much sharper the overlay's outline is than nearby picture, averaged over frames; 1.0 means it is gone."""
@@ -431,6 +461,18 @@ def _fitted(mark: Mark, crops: list[Frame]) -> Mark:
         seen, behind = zip(*((p[sel_c], _inpaint(p, unknown_c)[sel_c]) for p in (q.astype(np.float32) for q in planes)))
         parts.append(Part(chroma, sel_c, keep_c[sel_c], _line(np.stack(seen), np.stack(behind), keep_c[sel_c])[1]))
     return Mark(mark.box, mark.kind, mark.opacity, parts)
+
+
+def _printed(sel: np.ndarray, stray: np.ndarray, mean: np.ndarray, lumas: list[np.ndarray]) -> np.ndarray:
+    """Which of lumas (crops of the padded area, averaging mean) printed stray (overlay pixels sel the line fit reads
+    as not dimmed) into the variance: a few alike, very high-contrast frames, such as a menu lying across the box, make
+    the pixels beside stray vary far more than stray itself in those frames only."""
+    beside = cv2.dilate(stray.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool) & ~sel
+    if not stray.any() or not beside.any():
+        return np.zeros(len(lumas), bool)
+    gap = np.array([d[beside].mean() - d[stray].mean() for d in ((y - mean) ** 2 for y in lumas)])
+    middle = np.median(gap)
+    return gap - middle > PRINTED * max(1.4826 * np.median(np.abs(gap - middle)), 1e-6)
 
 
 def _stats(frames: Iterable[Frame], few: str = "the video has too few frames to measure the overlay"

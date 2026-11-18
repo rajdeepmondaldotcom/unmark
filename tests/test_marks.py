@@ -347,6 +347,49 @@ def test_refining_on_frames_where_nothing_can_be_measured_says_so(tmp_path, meas
         mark.refined(yuv(np.clip(frames, 0, 255).astype(np.uint8), tmp_path))
 
 
+WORDS = (("Back", 50), ("Key", 170))  # the menu bar's words and where they start
+
+
+def menu(frame: np.ndarray, ink: int | None = None) -> np.ndarray:
+    """Draw a game's menu bar on frame in place: a light bar across rows 78 to 112 with white words outlined in black,
+    like the map screen of the real video. With ink, only the words' pixels in that value."""
+    if ink is None:
+        frame[78:112] = np.rint(0.2 * frame[78:112] + 0.8 * 225)
+    for word, x in WORDS:
+        for colour, width in (((0, 0, 0), 6), ((255, 255, 255), 2)) if ink is None else ((ink, 6), ):
+            cv2.putText(frame, word, (x, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.9, colour, width, cv2.LINE_AA)
+    return frame
+
+
+def test_a_menu_bar_in_a_few_frames_does_not_print_itself_into_the_overlay(tmp_path):
+    box = (40, 60, 240, 64)
+    # dim pictures, each unlike the last, like samples spread over hours of a game at night, so the bar stands out
+    real = np.rint(30 + 0.3 * clean_frames(400, W, H, seed=5)).astype(np.uint8)
+    for i in (57, 140, 263, 342):  # 1% of the frames, never next to each other
+        menu(real[i])
+    opacity = text_opacity(W, H, box, "UNMARK")
+    shade = np.linspace(130, 250, W)[None, :, None]  # a shaded overlay, not one flat colour
+    frames = yuv(stamp(real, opacity, shade), tmp_path)
+
+    mark = marks.find(lambda: iter(frames), box)[0]
+
+    (ys, xs), sel = mark.parts[0].where, mark.parts[0].sel
+    overlay = np.zeros((H, W), bool)
+    overlay[ys, xs] = sel
+    near = cv2.dilate((opacity > 0.02).astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)  # with its soft edge
+    stray = int((overlay & ~near).sum())
+    flat = np.full((1, H, W, 3), 240, np.uint8)  # a bright flat scene, where a wrongly undone pixel shows most
+    clean, seen = yuv(np.concatenate([flat, stamp(flat, opacity, shade)]), tmp_path)
+    mark.erase(seen)
+    words = menu(np.zeros((H, W), np.uint8), 255) > 0
+    error = np.abs(seen.y.astype(np.float32) - clean.y)[words]
+    print(f"overlay pixels {int(overlay.sum())} (true {int((opacity > 0.02).sum())}), {stray} away from the true ones; "
+          f"bright flat frame cleaned, error at the menu's words: mean {error.mean():.2f}, "
+          f"99th percentile {np.percentile(error, 99):.0f}, most {error.max():.0f} levels")
+    assert stray < 50  # 6 without the menu bar
+    assert np.percentile(error, 99) <= 2  # 0 without the menu bar
+
+
 def test_finding_reads_the_frames_once_and_a_given_box_twice(tmp_path):
     two = text_opacity(W, H, TEXT) + text_opacity(W, H, (24, 110, 96, 48), "OK")
     clip = encode(stamp(clean_frames(150, W, H, seed=2), two), tmp_path / "two.mp4", audio=False)
