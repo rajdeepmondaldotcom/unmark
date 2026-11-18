@@ -219,7 +219,7 @@ class Mark:
         area = slice(ys.start - rows[0], ys.stop - rows[0])  # the held crops' rows that are the padded area
         crops = fit + [Frame(h.y[area], h.u, h.v) for h in held]
         out = _printed(measured.parts[0].sel, stray, mean[0][ys, xs], [c.y for c in crops])
-        if not out.any():
+        if not out.any() or (~out).sum() < 2:  # nothing to leave out, or too little left to measure from
             return chosen
         # measure again without them: their stats replace those of the padded area, the only part _measure reads
         kept_mean, kept_var = _stats(c for c, o in zip(crops, out) if not o)

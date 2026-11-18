@@ -135,6 +135,9 @@ So a lossless copy of that video would need 1.5 to 2 TB, which is why it is not 
    It measures this two ways: from how much the picture changes behind the overlay compared with around it, and,
    frame by frame, from the picture just around the overlay, which predicts the picture behind it well when the
    picture is smooth. It keeps whichever cleans a quarter of the frames, set aside for the purpose, best.
+   A few frames in which something else lies across the overlay (a game's menu or map screen, say) would print that
+   thing into the first measurement, and cleaning would then leave a faint ghost of it in every frame. So the tool
+   looks at where its two measurements disagree, finds the few frames that cause it, and measures again without them.
 3. It then undoes that in every frame that has the overlay: it subtracts the overlay's colour and brightens the
    picture back. How strongly the overlay dims colour is read again from each frame, because on a real video it
    dimmed colour more than brightness, by an amount that changed from scene to scene; frames with little colour keep
