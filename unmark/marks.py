@@ -30,9 +30,17 @@ PRINTED = 30.0
 FAINT = 1.0  # luma levels per pixel: an outline gradient this weak cannot be seen, so visibility counts it as none
 # Compression leaves errors of a few levels at and inside the overlay's letters, different in every frame, which undoing
 # it keeps. The part shaped like the overlay's edges softened is fitted and taken out; the rest is judged by comparing
-# the undone letters with the same letter shape moved onto nearby picture without the overlay (the yardstick): coarse
-# and fine detail are each kept where the letters are no rougher than the yardstick and filled from around where rougher
+# the undone letters with the same letter shape moved onto nearby picture without the overlay (the yardstick), and with
+# the picture right beside the letters, whichever is calmer (letters on a flat panel whose yardstick lands on busy
+# picture past the panel's edge): coarse and fine detail are each kept where the letters are no rougher than that and
+# filled from around where rougher
 RIM = 2  # luma pixels around the overlay that compression errors spill into, cleaned too and never predicted from
+AROUND = 5.0  # luma pixels: the band of picture beside the letters (and their rim) that is the second yardstick
+AROUND_SHARE = 0.02  # least weight of that band within NEAR of a pixel to judge by; less, and only the yardstick counts
+# times rougher than the letters the yardstick must be for that band to count, as it then lies on other picture; where
+# it is about as rough, texture under the letters is real and is kept. On known-right clips of a real video, letting the
+# band count everywhere took 20% more real texture from under the letters (error 2.02 to 2.42 levels), this 8% (2.18)
+OTHER = 2.0
 SPREAD = 6.0  # luma pixels: the spread of the average of the surrounding picture carried across the letters
 WIDE = 15.0  # luma pixels: a wider average, for inside closed letters (an "e", an "A") where SPREAD finds nothing
 WIDE_SHARE = 0.03  # its weight against SPREAD's, so it only counts where SPREAD has nothing to average
@@ -262,6 +270,7 @@ class Plan(NamedTuple):
     clear_norm: np.ndarray  # clear spread over SOFT
     scale: int  # luma pixels per pixel of this plane, which the spreads (in luma pixels) are divided by
     area: slice  # the window's rows that are the part's padded area
+    beside: np.ndarray  # 1 on the picture within AROUND of the letters that is neither letters nor yardstick
 
 
 def _shrink(img: np.ndarray, sigma: float) -> tuple[np.ndarray, int]:
@@ -320,6 +329,8 @@ def _plan(part: Part, box: tuple[int, int, int, int], shape: tuple[int, int], ha
     # as undone), upgrade by moving the yardstick sideways if overlays that tall come
     yard = np.roll(mask, -shift, 0) if max(up, down) >= 0 else None
     known = (~(mask | yard if yard is not None else mask)).astype(np.float32)
+    r = max(1, round(AROUND / s))
+    beside = (cv2.dilate(mask.astype(np.uint8), np.ones((2 * r + 1,) * 2, np.uint8)) * known).astype(np.float32)
     letters_f = mask.astype(np.float32)
     core = lay(part.keep < OVERLAY, False).astype(np.uint8)
     k = np.ones((3, 3), np.uint8)
@@ -328,7 +339,7 @@ def _plan(part: Part, box: tuple[int, int, int, int], shape: tuple[int, int], ha
                 lay(1 / part.keep, 1), mask & inside, known,
                 np.maximum(_blur(known, SPREAD / s) + WIDE_SHARE * _blur(known, WIDE / s), 1e-6), letters_f, yard,
                 np.maximum(_shrink(letters_f, NEAR / s)[0], 1e-6),
-                shift, clear, np.maximum(_blur(clear, SOFT / s), 1e-6), s, area[0])
+                shift, clear, np.maximum(_blur(clear, SOFT / s), 1e-6), s, area[0], beside)
 
 
 def _behind(plane: np.ndarray, p: Plan) -> tuple[np.ndarray, np.ndarray]:
@@ -368,7 +379,7 @@ def _strength(seen: np.ndarray, base: np.ndarray, p: Plan) -> Plan:
 
 def _kept(coarse: np.ndarray, fine: np.ndarray, p: Plan) -> tuple[np.ndarray | float, np.ndarray | float]:
     """How much of the coarse and the fine detail to keep: by the share of the letters' roughness that is real
-    picture, the most the yardstick's roughness and NOISE allow."""
+    picture, the most the calmer of the yardstick and the picture beside the letters, and NOISE, allow."""
     if p.yard is None:
         return 1.0, 1.0
     energies = np.zeros((*coarse.shape, 4), np.float32)
@@ -380,10 +391,14 @@ def _kept(coarse: np.ndarray, fine: np.ndarray, p: Plan) -> tuple[np.ndarray | f
             energies[:p.shift, :, 2 * i + 1] = e[-p.shift:]
     rough, f = _shrink(energies * p.letters[..., None], NEAR / p.scale)
     rough /= p.near[..., None]
+    around = _shrink(np.dstack([coarse * coarse * p.beside, fine * fine * p.beside, p.beside]), NEAR / p.scale)[0]
+    there = around[..., 2] > AROUND_SHARE
     kept = []
     for which in (0, 1):
         letters, yard = rough[..., 2 * which], rough[..., 2 * which + 1]
-        real = letters - np.clip(letters - yard, 0, NOISE[which])
+        other = there & (yard > OTHER * (letters + CALM[which]))
+        beside = np.where(other, around[..., which] / np.maximum(around[..., 2], 1e-6), np.inf)
+        real = letters - np.clip(letters - np.minimum(yard, beside), 0, NOISE[which])
         lo, hi = FILL[which]
         kept.append(np.clip(((real + CALM[which]) / (letters + CALM[which]) - lo) / (hi - lo), 0, 1))
     kept = _grow(np.dstack(kept), f, coarse.shape)
@@ -614,6 +629,45 @@ def find(frames: Callable[[], Iterable[Frame]], box: tuple[int, int, int, int] |
     # top to bottom, then left to right
     boxes = sorted(_regions(chunks, *mean[0].shape[::-1]), key=lambda b: (b[1], b[0]))
     return [m for m in (_classify(mean, var, b, False) for b in boxes) if m]
+
+
+def carried(mark: Mark, size: tuple[int, int], width: int, height: int, frames: Iterable[Frame]) -> Mark:
+    """A see-through mark measured on a video of size (width, height), laid onto a width x height video and its
+    strength fitted to that video's frames: the same overlay on another upload, which may be a different size and have
+    it mixed in a little stronger or weaker. For videos whose own frames measure it badly (menus often across it)."""
+    if mark.kind != "see-through":
+        raise RuntimeError("only a see-through overlay can be reused; a solid one is filled in, so give its --box")
+    fx, fy = width / size[0], height / size[1]
+    x, y, w, h = mark.box
+    x0, y0 = int(x * fx) & ~1, int(y * fy) & ~1  # even, as the colour planes are half size
+    x1, y1 = int(np.ceil((x + w) * fx)), int(np.ceil((y + h) * fy))
+    box = (x0, y0, (x1 - x0 + 1) & ~1, (y1 - y0 + 1) & ~1)
+    if box[0] + box[2] > width or box[1] + box[3] > height:
+        raise RuntimeError("the reused overlay does not fit in this video; it was measured on a differently shaped one")
+    luma, chroma, _ = _area(box, width, height)
+    parts = []
+    for i, (p, where) in enumerate(zip(mark.parts, (luma, chroma, chroma))):
+        was, now = (size, (width, height)) if i == 0 else ((size[0] // 2, size[1] // 2), (width // 2, height // 2))
+        maps = np.zeros((was[1], was[0], 2), np.float32)  # what it dims and what it adds, laid over the whole frame
+        maps[p.where][p.sel] = np.stack([1 - p.keep, p.offset], axis=-1)
+        # a smaller copy of a video is averaged down, which these follow exactly where the picture is smooth
+        maps = cv2.resize(maps, now, interpolation=cv2.INTER_AREA if now[0] < was[0] else cv2.INTER_LINEAR)[where]
+        sel = maps[..., 0] > 1e-3
+        parts.append(Part(where, sel, 1 - maps[..., 0][sel], maps[..., 1][sel]))
+    laid = Mark(box, "see-through", mark.opacity, parts)
+    shows = adds = 0.0  # the strength this video shows it at, as _strength reads it per frame, over all frames
+    for f in frames:
+        plan = laid._planned(f)[0]
+        seen, base = _behind(f.y, plan)
+        if _present(seen, base, plan):
+            band = lambda img: _blur(img, STROKE[0]) - _blur(img, STROKE[1])
+            a = band(plan.offset - plan.dim * base)[plan.sel]
+            shows, adds = shows + float(band(seen - base)[plan.sel] @ a), adds + float(a @ a)
+    if not adds:
+        raise RuntimeError("the reused overlay is not in this video's frames; check that it is the same overlay")
+    s = min(max(shows / adds, 1 / STRONGEST), STRONGEST, (1 - FLOOR) / max(float(1 - parts[0].keep.min()), 1e-6))
+    return Mark(box, "see-through", mark.opacity * s,
+                [Part(p.where, p.sel, 1 - s * (1 - p.keep), s * p.offset) for p in parts])
 
 
 def _classify(mean: list[np.ndarray], var: list[np.ndarray], box: tuple[int, int, int, int], given: bool

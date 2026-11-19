@@ -5,6 +5,7 @@ import sys
 from functools import partial
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 from helpers import (
@@ -54,6 +55,25 @@ def test_clean_removes_see_through_overlay(tmp_path):
     clean, marked = clips(tmp_path)
     out = tmp_path / "out.mp4"
     assert cli.main(["clean", str(marked), "--box", ",".join(map(str, BOX)), "--out", str(out)]) == 0
+    check_cleaned(clean, marked, out)
+
+
+def test_a_mark_kept_from_a_larger_video_cleans_another_given_like(tmp_path):
+    # one channel's overlay, measured on a cleaner upload at twice the size, reused on a smaller one where it was mixed
+    # in 30% stronger: without its size and strength fitted here, the letters stay about 13 levels off
+    big = tuple(2 * v for v in BOX)
+    opacity = text_opacity(2 * W, 2 * H, big)
+    first = encode(stamp(clean_frames(150, 2 * W, 2 * H, seed=2), opacity), tmp_path / "first.mp4")
+    done = tmp_path / "first.clean.mp4"
+    assert cli.main(["clean", str(first), "--box", ",".join(map(str, big)), "--out", str(done)]) == 0
+    kept = tmp_path / "first.clean.mp4.mark.npz"
+    assert kept.exists()
+    real = clean_frames(150, 2 * W, 2 * H, seed=1)
+    smaller = lambda frames: np.stack([cv2.resize(f, (W, H), interpolation=cv2.INTER_AREA) for f in frames])
+    clean = encode(smaller(real), tmp_path / "clean.mp4")
+    marked = encode(smaller(stamp(real, opacity * 1.3)), tmp_path / "marked.mp4")
+    out = tmp_path / "out.mp4"
+    assert cli.main(["clean", str(marked), "--like", str(kept), "--out", str(out)]) == 0
     check_cleaned(clean, marked, out)
 
 
@@ -465,8 +485,9 @@ def test_a_continued_clean_does_not_measure_the_overlay_again(tmp_path, capsys, 
     assert read == ["out.mp4"], read  # only the check of the written video; nothing of the input was read to measure
     assert "earlier" in said and "continuing" in said and "see-through at" not in said, said
     assert decode(out, W, H).tobytes() == decode(one, W, H).tobytes() and visible in said
-    left = {"clean.mp4", "marked.mp4", "one.mp4", "out.mp4"} | ({"marked.marks.png"} if "--mark" in where else set())
-    assert {p.name for p in tmp_path.iterdir()} == left  # nothing of the stopped run is left behind
+    left = {"clean.mp4", "marked.mp4", "one.mp4", "out.mp4", "one.mp4.mark.npz", "out.mp4.mark.npz"}  # kept for --like
+    left |= {"marked.marks.png"} if "--mark" in where else set()
+    assert {p.name for p in tmp_path.iterdir()} == left  # nothing else of the stopped run is left behind
 
 
 def test_a_stopped_clean_does_not_continue_with_changed_cleaning_code(tmp_path, capsys, monkeypatch):

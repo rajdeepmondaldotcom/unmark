@@ -328,6 +328,26 @@ def test_compression_errors_on_a_textured_picture_keep_the_texture(tmp_path, mea
     assert min(kept) >= 0.9 and 0.9 <= np.mean(kept) <= 1.1
 
 
+def test_compression_errors_on_a_flat_panel_leave_no_outline_though_busy_picture_lies_beyond_it(tmp_path, measured):
+    # a game's phone or menu panel: flat and dark around the letters, with as much room as their height above them,
+    # and grainy picture past its edge, where much of the same letter shape moved off the letters (the yardstick) lands
+    mark, opacity, grey = measured
+    rng = np.random.default_rng(4)
+    x, y, w, h = TEXT
+    frames = np.clip(footage(8, W, H, scenes=8, seed=7) + rng.normal(0, 15, (8, H, W, 1)), 0, 255)
+    frames[:, y - 16:y + h + 12, x - 12:x + w + 12] = 45
+    seen, truth = zip(*(compressed(t, opacity, grey, rng, 3.0) for t in yuv(frames.astype(np.uint8), tmp_path)))
+    truth = [t[0] for t in truth]
+    for f in seen:
+        mark.erase(f)
+    box = np.s_[y:y + h, x:x + w]
+    ours = psnr(np.stack([f.y[box] for f in seen]), np.stack([t[box] for t in truth]))
+    shown, clean = (mark.visibility(media.Frame(a, f.u, f.v) for a, f in zip(out, seen))
+                    for out in ([f.y for f in seen], truth))
+    print(f"inside box vs truth: cleaned {ours:.2f} dB; visibility cleaned {shown:.2f}, truth {clean:.2f}")
+    assert ours > 50 and abs(shown - clean) < 0.1  # the bar a smooth picture is held to
+
+
 def test_a_frame_without_the_overlay_is_left_exactly_as_it_was(tmp_path, measured):
     mark = measured[0]
     for f in yuv(np.concatenate([footage(4, W, H, seed=9), still(4, W, H, seed=9)]), tmp_path):

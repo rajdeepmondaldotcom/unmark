@@ -1,4 +1,4 @@
-"""Command line: `unmark clean VIDEO [--box x,y,w,h | --mark N] [--out PATH]`."""
+"""Command line: `unmark clean VIDEO [--box x,y,w,h | --mark N | --like OTHER.mark.npz] [--out PATH]`."""
 
 from __future__ import annotations
 
@@ -140,8 +140,8 @@ def _progress() -> Callable[[int, int], None]:
     return show
 
 
-def clean(video: str, box_text: str | None, mark: int | None, out: str | None) -> int:
-    """Find or measure the overlay and write a copy of the video without it."""
+def clean(video: str, box_text: str | None, mark: int | None, out: str | None, like: str | None = None) -> int:
+    """Find or measure the overlay (or reuse one kept by an earlier run) and write a copy of the video without it."""
     src = Path(video)
     info = media.probe(src)
     suffix = src.suffix if src.suffix.lower() in media.MUXERS else ".mkv"
@@ -153,17 +153,28 @@ def clean(video: str, box_text: str | None, mark: int | None, out: str | None) -
     # unmark's own code too, so a run is never continued by a different version of the cleaning
     code = b"".join(f.read_bytes() for f in sorted(Path(__file__).parent.glob("*.py")))
     stat = src.stat()
+    reused = marks.Mark.load(Path(like)) if like else None
+    if like and (not reused or "size" not in reused[1]):
+        raise RuntimeError(f"{like} is not an overlay kept by unmark; give --like the .mark.npz file an earlier run "
+                           "left next to its cleaned video")
+    liked = hashlib.sha256(Path(like).read_bytes()).hexdigest() if like else None
 
-    def request(number: int | None) -> str:  # names this source, box or overlay number, and code
-        return hashlib.sha256(repr((stat.st_size, stat.st_mtime_ns, box_text, number)).encode() + code).hexdigest()
+    def request(number: int | None) -> str:  # names this source, box, overlay number or reused overlay, and code
+        return hashlib.sha256(repr((stat.st_size, stat.st_mtime_ns, box_text, number, liked)).encode()
+                              + code).hexdigest()
 
-    # next to the parts patch keeps, so a stopped run continues without measuring again
+    # next to the cleaned video: a stopped run continues without measuring again, and --like can reuse it
     saved = dst.with_name(dst.name + ".mark.npz")
-    loaded = marks.Mark.load(saved) if box_text is not None or mark is not None else None
+    loaded = marks.Mark.load(saved) if box_text is not None or mark is not None or like else None
     before = None
     if loaded and loaded[1].get("request") == request(mark):
         chosen, before = loaded[0], loaded[1]["before"]
-        print("using the overlay as measured by the earlier unfinished run")
+        print("using the overlay as measured by an earlier run")
+    elif reused:
+        chosen = marks.carried(reused[0], tuple(reused[1]["size"]), info["width"], info["height"],
+                               media.planes(src, SAMPLES))
+        print(f"reusing the overlay from {like}, laid onto this video at {chosen.opacity / reused[0].opacity:.2f} "
+              "times its strength there")
     elif box_text is not None:
         chosen = marks.find(lambda: media.planes(src, SAMPLES), _box(box_text, info["width"], info["height"]))[0]
     else:
@@ -199,7 +210,7 @@ def clean(video: str, box_text: str | None, mark: int | None, out: str | None) -
         if before <= VISIBLE:  # an outline that cannot be seen in the input means the measurement found only noise
             raise RuntimeError(marks.NOTHING)
         if chosen.kind != "solid":
-            chosen.save(saved, {"request": request(mark), "before": before})
+            chosen.save(saved, {"request": request(mark), "before": before, "size": [info["width"], info["height"]]})
     if chosen.kind == "solid":
         # shortcut: a solid fill is written in one go and cannot continue after a stop, as its filler only runs from
         # the first frame on; upgrade by starting the filler at each part if long videos with solid overlays come
@@ -208,8 +219,9 @@ def clean(video: str, box_text: str | None, mark: int | None, out: str | None) -
         cv2.setNumThreads(1)  # the area cleaned per frame is small: OpenCV's threads cost more than they save there
         key = hashlib.sha256(chosen.fingerprint() + code).hexdigest()
         n = media.patch(src, dst, chosen.erase, resume=key, progress=_progress())
-    saved.unlink(missing_ok=True)
     print(f"wrote {dst} ({n} frames)")
+    if saved.exists():
+        print(f"the overlay as measured is kept in {saved}: give it to --like to clean another video with it")
     after = chosen.visibility(media.planes(dst, CHECKS))
     print(f"overlay outline visibility (1.0 = gone): input {before:.2f}, output {after:.2f}")
     if after > VISIBLE:
@@ -231,6 +243,9 @@ def main(argv: list[str] | None = None) -> int:
     where = c.add_mutually_exclusive_group()
     where.add_argument("--box", help="overlay box in pixels: x,y,w,h; without it, overlays are found automatically")
     where.add_argument("--mark", type=int, help="number of the found overlay to remove, as listed")
+    where.add_argument("--like", help="reuse the overlay an earlier run measured on another video (the .mark.npz kept "
+                                      "next to that cleaned video), resized and its strength fitted to this one; for "
+                                      "videos where menus or captions often cover the overlay")
     c.add_argument("--out", help="output path; default <name>.clean<suffix> next to the input")
     d = sub.add_parser("doctor", help="check that ffmpeg (and ProPainter, if set up) work on this computer",
                        parents=[common])
@@ -240,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
     try:
-        return doctor.doctor(a.gpu) if a.cmd == "doctor" else clean(a.video, a.box, a.mark, a.out)
+        return doctor.doctor(a.gpu) if a.cmd == "doctor" else clean(a.video, a.box, a.mark, a.out, a.like)
     except (KeyboardInterrupt, EOFError):  # Ctrl-C, or Ctrl-D at the question
         print("\nstopped; any finished parts of the cleaned video are kept, and if there are some, running the same "
               "command again continues from them")

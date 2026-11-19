@@ -28,7 +28,7 @@ On Windows, follow [docs/SETUP_WINDOWS.md](docs/SETUP_WINDOWS.md) instead.
 
 ## Use
 
-There are three ways to run it.
+There are four ways to run it.
 
 **1. Let it find the overlay and ask you.**
 
@@ -54,6 +54,21 @@ little bigger than the overlay.
 ```
 uv run unmark clean holiday.mp4 --box 478,22,132,60
 ```
+
+**4. Reuse an overlay measured on another video.** Every run keeps what it measured in a small file next to the
+cleaned video, named after it with `.mark.npz` added. If another video has the same overlay (the same channel's next
+upload, say) but measures it badly, because a game's button prompts, menus or phone screens lie across it in many
+frames, give that file with `--like`:
+
+```
+uv run unmark clean part2.mp4 --like part1.clean.mp4.mark.npz
+```
+
+It lays the overlay onto this video, resized if this video is smaller or larger, and reads how strongly this video has
+it mixed in (it prints that factor). On a real 4 hour 21 minute 1080p download of a game walkthrough, whose button
+prompts covered the overlay in about half the frames, the video's own measurement picked the prompts up; the overlay
+measured on the same channel's 4K video, reused this way, cleaned it from 5.20 to 0.91 (see "Reading the result"),
+checked at 57 moments.
 
 The cleaned video is called `holiday.clean.mp4`, next to the original (`.clean.mkv` for videos that do not end in
 `.mp4`, `.mov` or `.mkv`). To choose another name, add `--out other-name.mp4`; the name must end in `.mp4`, `.mov` or
@@ -143,7 +158,9 @@ So a lossless copy of that video would need 1.5 to 2 TB, which is why it is not 
    dimmed colour more than brightness, by an amount that changed from scene to scene; frames with little colour keep
    the measured strength. Compression leaves small errors in and around the letters, which brightening makes stronger. So,
    pixel by pixel and frame by frame, where the picture around the letters is smooth the letters are filled from it,
-   and where it is detailed the undone picture is kept. The cleaning changes nothing outside the overlay's box, but
+   and where it is detailed the undone picture is kept. Where the picture right beside the letters is flat but the
+   picture a little further away is busy (a game's phone or menu panel lying across the overlay), the flat part decides.
+   The cleaning changes nothing outside the overlay's box, but
    the whole video is still re-encoded (see "Picture quality").
 4. A **solid** overlay hides the picture completely, so there is nothing to undo. The hidden area is filled in from the
    surrounding video instead: with ProPainter (an AI video filler) when it is set up on a computer with an NVIDIA
@@ -176,7 +193,9 @@ These are honest limits of this version.
   measured. On a 1080p download-quality test video the ghost is about one brightness level, which you may just find on
   a large plain area of one colour if you look for it. On strongly coloured pictures (a bright red wall, say) a faint
   darker ghost of the letters can stay, and on strongly coloured, fast or textured scenes a faint colour ghost too: the
-  colour strength read from such a frame can be a little off.
+  colour strength read from such a frame can be a little off. On a flat, dark panel whose edge comes within about the
+  letters' height of them (a game's phone call box, say), a faint trace of the letters can stay too, as the fill has
+  too little flat picture to come from.
 - **Near-solid parts of a see-through overlay** (the overlay hides 85% or more of the picture there) are brightened back
   as far as they can be, not filled. Those spots can look noisy.
 - **Solid overlays with the simple fill look soft.** The fill takes the whole box, not just the overlay's own pixels,
@@ -196,12 +215,12 @@ These are honest limits of this version.
   check it: 8 hours 15 minutes in all. The join only copies what is already written, so its time is the disk's. That
   disk was an external SSD on a USB 2 link, about 37 MB a second for reading and writing together.
 - **Stopping.** With a see-through overlay, the cleaned video is written in parts of 5 minutes of video, which are
-  kept if it stops (Ctrl-C, sleep, a lost disk). Run the same command again, with the same `--box` or `--mark`, and it
-  continues from the last finished part. It does not measure the overlay again: it uses the measurement it saved
-  before writing, in a file named after the output with `.mark.npz` added, and says so. A solid overlay, and a video
-  whose frame rate changes, are written in one go and cannot continue: they start over. The parts are kept in a folder
-  named after the output with `.parts` added. The folder and the saved measurement are removed when the video is
-  finished.
+  kept if it stops (Ctrl-C, sleep, a lost disk). Run the same command again, with the same `--box`, `--mark` or
+  `--like`, and it continues from the last finished part. It does not measure the overlay again: it uses the
+  measurement it saved before writing, in a file named after the output with `.mark.npz` added, and says so. A solid
+  overlay, and a video whose frame rate changes, are written in one go and cannot continue: they start over. The parts
+  are kept in a folder named after the output with `.parts` added, which is removed when the video is finished. The
+  saved measurement is kept, for `--like`.
 - **Unfinished parts are never deleted for you.** If a later run differs from the one that wrote them (another video,
   overlay, setting or version of unmark), it stops with an error saying the parts are kept: run the earlier command
   again to finish, or delete the `.parts` folder to start over. If the Mac's hardware encoder wrote them and does not
@@ -234,3 +253,8 @@ The tests build small videos with ffmpeg, with a known clean truth, and check th
 - `tests/fake_propainter/`: a stand-in for ProPainter's script, same arguments and output, used by the tests.
 
 Known shortcuts are marked in the code with `# shortcut:`; list them with `grep -rn "shortcut:" unmark`.
+
+## License
+
+MIT; see [LICENSE](LICENSE). ProPainter, which unmark can call for solid overlays, is not part of it and has its own
+license, which allows non-commercial use only.
