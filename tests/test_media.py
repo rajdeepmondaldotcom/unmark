@@ -432,6 +432,26 @@ def test_an_unfinished_run_continues_from_its_finished_parts(tmp_path, monkeypat
     assert sorted(p.name for p in tmp_path.iterdir()) == ["out.mp4", "src.mp4", "want.mp4"]
 
 
+def test_a_part_the_encoder_dropped_frames_from_is_written_again(tmp_path, monkeypatch):
+    # a Mac's hardware encoder can drop frames while the Mac sleeps and still exit as if it wrote them all: the part
+    # must not be kept short, or the finished video freezes there for a moment
+    monkeypatch.setattr(media, "CHUNK_S", 0.2)  # 6 frames per part
+    src = make(tmp_path / "src.mp4", noise(40, seed=9), fps=30, extra=SOUND)
+    want = tmp_path / "want.mp4"
+    media.patch(src, want, invert, crf=0)
+    fake, once = tmp_path / "ffmpeg", tmp_path / "dropped"
+    fake.write_text(  # the real ffmpeg, but its first encode from a pipe loses its third frame, keeping the times
+        f'#!/bin/sh\ncase "$*" in *"-i -"*) [ -e "{once}" ] || {{ touch "{once}"; for a do shift; '
+        f'[ "$a" = "settb=1/90000" ] && a="settb=1/90000,select=\'not(eq(n,2))\'"; set -- "$@" "$a"; done; }};; esac\n'
+        f'exec "{shutil.which("ffmpeg")}" "$@"\n')
+    fake.chmod(0o755)
+    monkeypatch.setenv("UNMARK_FFMPEG", str(fake))
+    out = tmp_path / "out.mp4"
+    assert media.patch(src, out, invert, crf=0, resume="a") == 40
+    assert once.exists()  # a frame really was dropped once
+    assert raw(out) == raw(want) and audio_md5(out) == audio_md5(src)
+
+
 def test_a_continued_run_on_an_exfat_disk_does_not_count_the_companion_files_as_parts(tmp_path, monkeypatch):
     monkeypatch.setattr(media, "CHUNK_S", 0.2)  # 6 frames per part
     src = make(tmp_path / "src.mp4", noise(40, seed=9), fps=30, extra=SOUND)

@@ -48,11 +48,17 @@ HARDWARE = "hevc_videotoolbox"
 QUALITY = 74
 KEY_S = 2  # seconds between keyframes
 SPARE = 1.05  # the joined video holds the sound too, so this much more than the parts' size must be free to join them
+TRIES = 3  # times a part is written before giving up, when the encoder keeps fewer frames than it was sent
 # finished parts' names; the digit keeps out the "._" companion files macOS adds beside each on exFAT and FAT disks
 PARTS = "[0-9]*-*.nut"
 # video stream tags that describe the source's encoding, not the picture, so the cleaned video must not copy them
 STALE = {"DURATION", "BPS", "NUMBER_OF_FRAMES", "NUMBER_OF_BYTES", "ENCODER", "_STATISTICS_WRITING_APP",
          "_STATISTICS_WRITING_DATE_UTC", "_STATISTICS_TAGS"}
+
+
+class _Dropped(RuntimeError):
+    """The encoder kept fewer frames than it was sent, and still exited as if all was well (a Mac's hardware encoder
+    did, while the Mac kept falling asleep)."""
 
 
 @dataclass
@@ -320,7 +326,14 @@ def patch(src, dst, edit: Callable[[Frame], None], crf: int | None = None, resum
         if progress:
             progress(sum(done), total)
         while not done or (each and done[-1] == each):
-            n = _encode(src, work / f"{len(done):06d}", edit, info, codec, each, len(done) * each)
+            for attempt in range(1, TRIES + 1):
+                try:
+                    n = _encode(src, work / f"{len(done):06d}", edit, info, codec, each, len(done) * each)
+                    break
+                except _Dropped as e:
+                    if attempt == TRIES:
+                        raise RuntimeError(f"{e}, {TRIES} times running; the finished parts are kept, so run the "
+                                           "same command again (with the computer kept awake)") from None
             if not n:
                 break
             done.append(n)
@@ -400,6 +413,13 @@ def _encode(src: Path, name: Path, edit: Callable[[Frame], None], info: dict, co
             if dec.returncode != 0:
                 raise _fail(dec, dlog)
         if n:
+            # shortcut: reads the part back to count its frames, about 8 s a part on a USB 2 disk; upgrade to the
+            # encoder's own packet statistics if that ever matters
+            count = _run([_bin("ffprobe"), "-v", "error", "-select_streams", "v:0", "-count_packets",
+                          "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(tmp)])
+            kept = int(count.stdout.strip() or 0)
+            if kept != n:
+                raise _Dropped(f"the video encoder kept {kept} of the {n} frames it was sent for one part")
             with open(tmp, "rb+") as f:  # on the disk before it looks finished, so a lost disk cannot cut it short
                 os.fsync(f.fileno())
             tmp.replace(name.with_name(f"{name.name}-{n}.nut"))
